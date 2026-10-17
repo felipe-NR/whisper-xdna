@@ -23,3 +23,6 @@ ironenv/
 __pycache__/
 *.pyc
 .ruff_cache/
+
+# host-local compose settings
+.env
