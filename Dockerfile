@@ -11,7 +11,9 @@
 # Add --build-arg WITH_REFERENCE=1 for the torch/openai-whisper virtualenv used
 # to generate the reference tensors, to decode NPU output into text, and to run
 # the HTTP service in serve/. It costs about 1.2 GB, which is why it is off by
-# default.
+# default. Add --build-arg WITH_CT2=1 as well for the CTranslate2 decoder
+# (NPU_STT_DECODER=ct2, see serve/README.md); serve/ct2.Dockerfile layers the
+# same thing onto an image already built.
 #
 # Two stages on purpose. Everything is assembled in `build`, which carries a C
 # toolchain, git and pip caches, and the final image copies out only the two
@@ -67,16 +69,43 @@ RUN rm -rf /opt/mlir-aie/.git /opt/mlir-aie/test /opt/mlir-aie/mlir_exercises \
 # torch and openai-whisper: needed by tools/dump_ref.py, tools/decode_with.py
 # and by the serving path in serve/, which runs the decoder in this environment.
 # ml_dtypes comes along because rawxrt needs bfloat16 and this venv is where the
-# server lives. triton is a GPU compiler pip installs beside torch and nothing
-# here can use it. Off by default: the encoder itself needs none of this.
+# server lives. Off by default: the encoder itself needs none of this.
+#
+# Installed from requirements/refenv.lock.txt, every package at an exact
+# version, with --no-deps: the venv is that list and nothing a resolver picked
+# on the day of the build (unpinned, a rebuild drifted from the image the tests
+# passed on). triton is not in the list -- a GPU compiler nothing here uses.
+COPY requirements/ /tmp/requirements/
 ARG WITH_REFERENCE=0
 RUN if [ "${WITH_REFERENCE}" = "1" ]; then \
       python3 -m venv /opt/refenv \
-   && /opt/refenv/bin/pip install --no-cache-dir \
+   && /opt/refenv/bin/pip install --no-cache-dir --no-deps \
         --extra-index-url https://download.pytorch.org/whl/cpu \
-        torch openai-whisper ml_dtypes \
-   && /opt/refenv/bin/pip uninstall -y triton ; \
+        -r /tmp/requirements/refenv.lock.txt ; \
     else mkdir -p /opt/refenv ; \
+    fi
+
+# CTranslate2 for NPU_STT_DECODER=ct2 (serve/ct2_decoder.py), which lives in the
+# serving venv, so it needs WITH_REFERENCE=1 too. Versions in
+# requirements/refenv-ct2.lock.txt, --no-deps for the same reason.
+ARG WITH_CT2=0
+RUN if [ "${WITH_CT2}" = "1" ]; then \
+      test -x /opt/refenv/bin/pip \
+        || { echo "WITH_CT2=1 needs WITH_REFERENCE=1 (refenv)" >&2; exit 1; } \
+   && /opt/refenv/bin/pip install --no-cache-dir --no-deps \
+        -r /tmp/requirements/refenv-ct2.lock.txt ; \
+    fi
+
+# The venv must be exactly the lock files: same packages, same versions,
+# nothing extra. A mismatch fails the build here with the diff.
+RUN if [ -x /opt/refenv/bin/pip ]; then \
+      locks=/tmp/requirements/refenv.lock.txt \
+   && if [ "${WITH_CT2}" = "1" ]; then \
+        locks="$locks /tmp/requirements/refenv-ct2.lock.txt"; fi \
+   && cat $locks | grep -vE '^[[:space:]]*(#|$)' | LC_ALL=C sort -f > /tmp/want \
+   && /opt/refenv/bin/pip freeze --all --exclude pip | LC_ALL=C sort -f > /tmp/have \
+   && diff -u /tmp/want /tmp/have \
+   && echo "refenv matches $locks" ; \
     fi
 
 # --------------------------------------------------------------------------
@@ -115,11 +144,25 @@ ENV PEANO_INSTALL_DIR=/opt/mlir-aie/ironenv/lib/python3.13/site-packages/llvm-ai
 RUN test -d "${PEANO_INSTALL_DIR}" \
  && python3 -c "import aie.iron; import pyxrt; print('iron + pyxrt ok')"
 
+# Same for the ct2 decoder: an import that breaks (numpy/numba, a missing
+# converter dependency) fails the build, not the first start of the service.
+ARG WITH_CT2=0
+RUN if [ "${WITH_CT2}" = "1" ]; then \
+      /opt/refenv/bin/python -c "import ctranslate2, whisper, numba, yaml; \
+from ctranslate2.converters.converter import Converter; \
+print('ctranslate2', ctranslate2.__version__, 'cpu', \
+sorted(ctranslate2.get_supported_compute_types('cpu')))" ; \
+    fi
+
 # Ties the published package to its repository and licence on registries that
 # read OCI labels (GHCR shows the repo, the README and the licence from these).
+# revision is the commit the image was built from:
+#   docker build --build-arg VCS_REF=$(git rev-parse HEAD) ...
+ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/drakosha/whisper-xdna" \
       org.opencontainers.image.description="Whisper encoder on the AMD XDNA1 NPU (Ryzen AI, Phoenix) with an HTTP service speaking whisper.cpp's contract" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="${VCS_REF}"
 
 COPY . /opt/npu-whisper
 WORKDIR /opt/npu-whisper

@@ -12,22 +12,32 @@
 ARG BASE=kostryukov/npu-whisper:1.3.4
 FROM ${BASE}
 
-# --no-deps on purpose: ctranslate2 asks for numpy, and letting pip resolve it
-# replaces refenv's numpy with one numba (openai-whisper's dependency) refuses
-# to import with. pyyaml is the one thing its converter package needs that
-# refenv does not already carry.
-ARG CT2_VERSION=4.8.2
-ARG PYYAML_VERSION=6.0.2
+# Versions in requirements/refenv-ct2.lock.txt, the same file Dockerfile uses
+# with WITH_CT2=1. --no-deps on purpose: ctranslate2 asks for numpy, and
+# letting pip resolve it replaces refenv's numpy with one numba
+# (openai-whisper's dependency) refuses to import.
+COPY requirements/ /tmp/requirements/
 RUN /opt/refenv/bin/pip install --no-cache-dir --no-deps \
-      "ctranslate2==${CT2_VERSION}" "pyyaml==${PYYAML_VERSION}" \
- && /opt/refenv/bin/python -c "import ctranslate2, whisper, yaml; \
+      -r /tmp/requirements/refenv-ct2.lock.txt \
+ && /opt/refenv/bin/python -c "import ctranslate2, whisper, numba, yaml; \
 from ctranslate2.converters.converter import Converter; \
 print('ctranslate2', ctranslate2.__version__, 'cpu', \
 sorted(ctranslate2.get_supported_compute_types('cpu')))"
+
+# The base image's refenv plus the ct2 lock must be exactly the two lock files,
+# as in Dockerfile. This is what catches a BASE built from something else.
+RUN cat /tmp/requirements/refenv.lock.txt /tmp/requirements/refenv-ct2.lock.txt \
+      | grep -vE '^[[:space:]]*(#|$)' | LC_ALL=C sort -f > /tmp/want \
+ && /opt/refenv/bin/pip freeze --all --exclude pip | LC_ALL=C sort -f > /tmp/have \
+ && diff -u /tmp/want /tmp/have \
+ && echo "refenv matches requirements/refenv*.lock.txt"
 
 COPY . /opt/npu-whisper
 # COPY replaces the refenv link the base image made inside the checkout only if
 # the tree carries one (.dockerignore keeps refenv/ out); make sure it exists.
 RUN ln -sfn /opt/refenv /opt/npu-whisper/refenv
 
-LABEL org.opencontainers.image.description="Whisper encoder on the AMD XDNA1 NPU with a CTranslate2 CPU decoder"
+# The commit this image was built from: --build-arg VCS_REF=$(git rev-parse HEAD)
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.description="Whisper encoder on the AMD XDNA1 NPU with a CTranslate2 CPU decoder" \
+      org.opencontainers.image.revision="${VCS_REF}"
