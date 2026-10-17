@@ -39,6 +39,12 @@ Ryzen 7 8700G (XDNA1, firmware 1.5.5.391), kernel 7.2.5, image
 | serve-torch | 15/15 (with the two pt-BR clips of `docs/research.md`) |
 | serve-ct2 | 20/20, all 5 transcripts identical to the torch run |
 
+The same stages (`cpu npu serve`) also pass, with the same counts, on the image
+built from the main `Dockerfile` (`WITH_REFERENCE=1 WITH_CT2=1`, commit
+`ea33950`, 2026-10-17), which carries XRT 2.25.0 and a newer `ironenv`. The
+encoder golden is still bit-identical there. See "Pinned versions" in the
+top-level README.
+
 ## Two things the tests caught
 
 - **int8 on whisper-tiny flips a comma.** "for you, ask" against "for you ask"

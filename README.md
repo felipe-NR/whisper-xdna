@@ -462,6 +462,20 @@ was in that image. Everything that the lock does not cover is listed too.
 To move a version: edit the lock, rebuild, run
 [`tests/run_all.sh`](tests/README.md), and update this table.
 
+Builds validated with the full suite (`tests/run_all.sh`: every stage
+passed, including the bit-identical encoder golden), on a Ryzen 7 8700G with
+NPU firmware 1.5.5.391:
+
+| Image | Built | `refenv` | XRT | Rest of `ironenv` |
+|---|---|---|---|---|
+| `kostryukov/npu-whisper:1.3.4` (+ `serve/ct2.Dockerfile`) | 2026-07-26 | the lock | 2.21.75+dfsg-9~bpo13+1 | `numpy` 2.5.1, `ml_dtypes` 0.5.4 |
+| `Dockerfile`, `WITH_REFERENCE=1 WITH_CT2=1`, commit `ea33950` | 2026-10-17 | the lock, identical (`pip freeze` diff empty) | **2.25.0-4~bpo13+1** | `numpy` 2.5.4, `ml_dtypes` 0.6.0, and ~40 notebook/tooling packages moved |
+
+Three months were enough for trixie-backports to replace XRT 2.21.75 with
+2.25.0. Encoder output stayed bit-identical, and timings stayed within noise
+(the 20 s clip's encoder: ~3100 → 3040 ms). The unpinned rows above are where a
+future rebuild can change things.
+
 ## Serving it
 
 `serve/` wraps the encoder in an HTTP endpoint that speaks the same multipart
