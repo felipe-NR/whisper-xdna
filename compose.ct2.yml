@@ -5,10 +5,12 @@
 # or, once, in .env:  COMPOSE_FILE=compose.yml:compose.ct2.yml
 # and plain `docker compose ...` uses both files.
 #
-# stt is rebuilt from serve/ct2.Dockerfile on top of NPU_WHISPER_BASE (an image
-# built WITH_REFERENCE=1, the published one by default) and decodes with ct2
-# unless NPU_STT_DECODER says otherwise. Everything else -- device, volumes,
-# ports, the other knobs -- is compose.yml's.
+# stt is built from the repository's Dockerfile with the reference venv and
+# the CTranslate2 decoder (WITH_REFERENCE=1 WITH_CT2=1, versions from
+# requirements/*.lock.txt) and decodes with ct2 unless NPU_STT_DECODER says
+# otherwise. Everything else -- device, volumes, ports, the other knobs -- is
+# compose.yml's. VCS_REF (tests/run_all.sh sets it to the commit) is recorded
+# as the image's org.opencontainers.image.revision.
 #
 # The test-* services only start when asked for (profile "test"); run them
 # through tests/run_all.sh, which also takes stt down for the NPU tests:
@@ -20,9 +22,11 @@ services:
   stt:
     build:
       context: .
-      dockerfile: serve/ct2.Dockerfile
+      dockerfile: Dockerfile
       args:
-        BASE: "${NPU_WHISPER_BASE:-kostryukov/npu-whisper:1.3.4}"
+        WITH_REFERENCE: "1"
+        WITH_CT2: "1"
+        VCS_REF: "${VCS_REF:-unknown}"
     image: npu-whisper:ct2
     environment:
       NPU_STT_DECODER: "${NPU_STT_DECODER:-ct2}"

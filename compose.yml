@@ -65,8 +65,8 @@ services:
       NPU_STT_LANG: "${NPU_STT_LANG:-ru}"
       # Contexts to compile overlays for; a request is rounded up onto them.
       NPU_STT_LADDER: "${NPU_STT_LADDER:-512,768,1024,1280,1500}"
-      # CPU decoder: torch (whisper.decode, fp32) or ct2 (CTranslate2, needs
-      # the serve/ct2.Dockerfile image). See docs/decoder.md.
+      # CPU decoder: torch (whisper.decode, fp32) or ct2 (CTranslate2, needs an
+      # image built WITH_CT2=1 -- compose.ct2.yml does that). See docs/decoder.md.
       NPU_STT_DECODER: "${NPU_STT_DECODER:-torch}"
       NPU_STT_CT2_COMPUTE: "${NPU_STT_CT2_COMPUTE:-int8}"
       NPU_STT_CT2_THREADS: "${NPU_STT_CT2_THREADS:-8}"

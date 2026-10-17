@@ -7,7 +7,9 @@
 #
 # Stages:
 #   host   tests/test_compare_dictation.py: stdlib, no container
-#   build  the ct2 image (compose.ct2.yml)
+#   build  the ct2 image from Dockerfile (compose.ct2.yml: WITH_REFERENCE=1
+#          WITH_CT2=1), labelled with the commit; BUILD_FLAGS=--no-cache for a
+#          build from nothing
 #   cpu    test-cpu: serve/ct2_decoder.py unit tests (whisper-tiny) and the
 #          large-v3-turbo equivalence run against whisper.decode
 #   npu    test-npu: the NPU acceptance gate (rowops, chain accuracy, encoder
@@ -21,6 +23,11 @@ cd "$(dirname "$0")/.."
 
 export COMPOSE_FILE=compose.yml:compose.ct2.yml
 export RENDER_GID="${RENDER_GID:-$(getent group render | cut -d: -f3)}"
+# The image's org.opencontainers.image.revision. A tree with uncommitted
+# changes is not that commit, and the label says so.
+VCS_REF="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+[ -n "$(git status --porcelain 2>/dev/null)" ] && VCS_REF="$VCS_REF-dirty"
+export VCS_REF
 URL="${STT_URL:-http://127.0.0.1:8090}"
 STAGES="${*:-host build cpu npu serve}"
 TMP="$(mktemp -d)"
@@ -48,15 +55,18 @@ restore() {
 trap restore EXIT
 
 stage() {      # stage NAME COMMAND...
-  local name="$1"; shift
+  local name="$1" t0=$SECONDS; shift
   echo; echo "========== $name"
-  if "$@"; then echo "---------- $name: ok"; else echo "---------- $name: FAILED"; FAILED+=("$name"); fi
+  if "$@"; then echo "---------- $name: ok ($((SECONDS - t0)) s)"
+  else echo "---------- $name: FAILED ($((SECONDS - t0)) s)"; FAILED+=("$name"); fi
 }
 
 for s in $STAGES; do
   case "$s" in
     host)  stage host python3 -I tests/test_compare_dictation.py ;;
-    build) stage build docker compose build stt ;;
+    build) echo "building revision $VCS_REF"
+           # shellcheck disable=SC2086  # BUILD_FLAGS is a list of flags
+           stage build docker compose build ${BUILD_FLAGS:-} stt ;;
     cpu)   stage cpu docker compose --profile test run --rm test-cpu ;;
     npu)
       TOUCHED_STT=1

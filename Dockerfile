@@ -12,8 +12,7 @@
 # to generate the reference tensors, to decode NPU output into text, and to run
 # the HTTP service in serve/. It costs about 1.2 GB, which is why it is off by
 # default. Add --build-arg WITH_CT2=1 as well for the CTranslate2 decoder
-# (NPU_STT_DECODER=ct2, see serve/README.md); serve/ct2.Dockerfile layers the
-# same thing onto an image already built.
+# (NPU_STT_DECODER=ct2, see serve/README.md); compose.ct2.yml builds it so.
 #
 # Two stages on purpose. Everything is assembled in `build`, which carries a C
 # toolchain, git and pip caches, and the final image copies out only the two
