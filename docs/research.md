@@ -29,6 +29,13 @@ NPU × iGPU.
   array"; no modo `remote` só o primeiro idioma é usado). A detecção automática
   fica restrita aos idiomas da lista (~50 ms na primeira janela). Não existe
   uma opção de idioma por gravação em `voxtype record`.
+- **Use `pt`, não `pt-br`.** O Whisper usa códigos ISO 639-1 de duas letras,
+  sem variante regional; um único `pt` cobre Brasil e Portugal. Testado: o
+  voxtype aceita `pt-br`, `pt-BR` e `pt_BR` na configuração, mas o whisper.cpp
+  responde `whisper_lang_id: unknown language 'pt-br'` e cai na detecção
+  automática, ou seja, funciona por acaso. Para puxar o vocabulário e a grafia
+  brasileiros, o recurso é o `whisper.initial_prompt` (um texto curto em pt-BR
+  com termos do seu domínio).
 - Aceleração disponível no voxtype:
   - `voxtype setup gpu`: Vulkan (Whisper) ou CUDA/MIGraphX (Parakeet).
   - `voxtype setup npu`: **somente NPU Intel via OpenVINO**. A NPU AMD XDNA não
@@ -128,6 +135,21 @@ Projetos derivados:
     `crw-rw-rw- root:render`.
   - Docker sem relogin: `sudo setfacl -m u:$USER:rw /var/run/docker.sock`
     (temporário, até o Docker reiniciar; depois vale o grupo `docker`).
+  - Configuração persistente: o `compose.yml` deste fork aceita
+    `STT_RESTART` (padrão `no`, como no upstream, para não competir com a
+    unit systemd em `serve/units/`). Neste host, as variáveis ficam num
+    `.env` local, fora do git:
+
+    ```ini
+    NPU_WHISPER_IMAGE=kostryukov/npu-whisper:1.3.4
+    RENDER_GID=987
+    NPU_STT_LANG=pt
+    STT_PORT=127.0.0.1:8090
+    STT_RESTART=unless-stopped
+    ```
+
+    Basta `docker compose up -d stt`. Com os volumes em cache, o serviço fica
+    pronto em ~20 s (prewarm de 2 a 4 s por contexto).
 
 ## Comparação prática
 

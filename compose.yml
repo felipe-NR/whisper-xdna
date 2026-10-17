@@ -64,9 +64,10 @@ services:
       NPU_STT_LADDER: "${NPU_STT_LADDER:-512,768,1024,1280,1500}"
       # Other NPU_STT_* knobs (see serve/npu_stt_server.py) go here too — the
       # container sees only what this block passes through.
-    # No restart policy on purpose: under serve/units/npu-stt.service systemd is
-    # the supervisor, and two of them fight over the same container. Add one
-    # here if you run compose without systemd.
+    # No restart policy by default: under serve/units/npu-stt.service systemd is
+    # the supervisor, and two of them fight over the same container. Set
+    # STT_RESTART=unless-stopped when you run compose without systemd.
+    restart: "${STT_RESTART:-no}"
 
 volumes:
   aot:
