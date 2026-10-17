@@ -165,10 +165,16 @@ checks that on CPU against `whisper.decode` for 3 clips × 3 contexts, including
 two where both decoders loop, and stop on the same token.
 
 ```bash
-docker build -f serve/ct2.Dockerfile -t npu-whisper:ct2 .
-NPU_WHISPER_IMAGE=npu-whisper:ct2 NPU_STT_DECODER=ct2 \
-  RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d stt
+# compose.ct2.yml builds the overlay image and sets NPU_STT_DECODER=ct2
+RENDER_GID=$(getent group render | cut -d: -f3) \
+  docker compose -f compose.yml -f compose.ct2.yml up -d --build stt
 ```
+
+To make that the default for every `docker compose` call in the checkout, put
+`COMPOSE_FILE=compose.yml:compose.ct2.yml` in `.env`. `NPU_WHISPER_BASE` picks
+the image the overlay extends (default `kostryukov/npu-whisper:1.3.4`; any
+image built from `Dockerfile` with `WITH_REFERENCE=1` works). Tests:
+[`tests/README.md`](../tests/README.md).
 
 How it works:
 

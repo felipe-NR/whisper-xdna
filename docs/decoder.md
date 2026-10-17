@@ -203,6 +203,12 @@ docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
 
 ### Validação
 
+A suíte automatizada (`tests/run_all.sh`, descrita em
+[`tests/README.md`](../tests/README.md)) cobre tudo abaixo e também a
+**suíte da NPU do repositório** (`test_rowops`, `test_chain_acc` e
+`test_encoder_golden` 14/14, bit a bit), que passa neste host com a imagem
+`ct2`. Em resumo:
+
 - **CPU, contra o `whisper.decode`** (`tests/test_ct2_decoder.py`, imagem
   `npu-whisper:ct2`): 3 clipes (jfk/en, curto/pt, longo/pt) × ctx 1500/1280/512
   = **9/9 com texto idêntico**. Inclui os dois casos em que o clipe é maior
