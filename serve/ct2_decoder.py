@@ -280,6 +280,15 @@ class CT2Decoder:
                                 suppress_tokens=[-1], max_length=2 * SAMPLE_LEN)
         return tokenizer.decode(r[0].sequences_ids[0]).strip()
 
+    def language_probs(self, feats):
+        """{language code: probability} for one window of encoder output.
+
+        CTranslate2's detect_language runs the same single decoder step over
+        the language tokens that whisper.detect_language does.
+        """
+        x = self._sv.from_array(np.ascontiguousarray(feats[None], dtype=np.float32))
+        return {tok[2:-2]: p for tok, p in self.model.detect_language(x)[0]}
+
 
 if __name__ == "__main__":
     _main()

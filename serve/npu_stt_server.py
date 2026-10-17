@@ -33,6 +33,7 @@ here dies with the process it lives in.
 """
 import functools
 import json
+import math
 import os
 import re
 import subprocess
@@ -59,7 +60,8 @@ HOST = os.environ.get("NPU_STT_HOST", "0.0.0.0")
 # on first start. A path here loads an .npz from tools/dump_ref.py instead.
 WEIGHTS = os.environ.get("NPU_STT_WEIGHTS", "").strip()
 MODEL = os.environ.get("NPU_STT_MODEL", "large-v3-turbo")
-LANG = os.environ.get("NPU_STT_LANG", "ru")
+# Used when a request names no language. "auto" here makes detection the default.
+LANG = os.environ.get("NPU_STT_LANG", "en").strip().lower()
 # Every distinct context is its own set of compiled overlays, and a client that
 # computes audio_ctx from speech length sends a continuum. Round UP onto
 # a fixed ladder: bounded overlay set, warm at start, never less context than
@@ -76,6 +78,18 @@ if not LADDER:
 # full context. whisper.cpp's own default is -ac 512, but a 512 cap on
 # unknown-length speech is what makes the decoder loop on the tail.
 DEFAULT_CTX = int(os.environ.get("NPU_STT_DEFAULT_CTX", "1500"))
+# ...unless NPU_STT_CTX_FROM_AUDIO=1: then the length is not unknown -- the
+# server has just decoded the audio -- and the context is sized to it (50
+# encoder positions per second plus a margin, rounded up onto the ladder), so a
+# client like voxtype's remote mode, which never sends audio_ctx, stops paying
+# for a 30 s encoder pass on every short phrase. Never less than the audio.
+CTX_FROM_AUDIO = os.environ.get("NPU_STT_CTX_FROM_AUDIO", "0") != "0"
+# language=auto: detect the spoken language on the first window and decode in
+# it, choosing only among NPU_STT_DETECT_LANGS (comma-separated codes; empty
+# means any language the checkpoint knows). An absent language is not "auto":
+# it means NPU_STT_LANG.
+DETECT_LANGS = [x.strip().lower() for x in
+                os.environ.get("NPU_STT_DETECT_LANGS", "").split(",") if x.strip()]
 # Measured: the decoder's wall clock is flat across 4/8/16 threads
 # -- 103 sequential steps, latency-bound, not throughput-bound -- but the CPU it
 # burns is not, and 16 costs the least (6.2 CPU-s on the 22.6 s sample against
@@ -279,6 +293,34 @@ def ctx_for(requested):
     return LADDER[-1]
 
 
+def ctx_from_audio(n_samples):
+    """Encoder positions that cover n_samples, with a 10% + 16 margin.
+
+    Whisper's encoder emits 50 positions per second of audio (1500 for 30 s).
+    Anything at or over one window needs the full context: every window is
+    30 s except the last.
+    """
+    seconds = n_samples / SR
+    if seconds >= N_SAMPLES / SR:
+        return LADDER[-1]
+    return min(LADDER[-1], math.ceil(seconds * 50 * 1.1) + 16)
+
+
+def _detect_language(feats, mel):
+    """Most likely language of one window, among DETECT_LANGS if set."""
+    if CT2 is not None:
+        probs = CT2.language_probs(feats)
+    else:
+        HOLDER["feats"] = TORCH.from_numpy(feats).unsqueeze(0).float()
+        try:
+            _, p = WHISPER.detect_language(MODEL_OBJ, mel.unsqueeze(0), _tokenizer("en"))
+        finally:
+            HOLDER.pop("feats", None)
+        probs = p[0]
+    allowed = [lang for lang in DETECT_LANGS if lang in probs] or list(probs)
+    return max(allowed, key=probs.get)
+
+
 # ------------------------------------------------------------------- audio
 def ffmpeg_decode(raw, suffix):
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as f:
@@ -372,7 +414,11 @@ def ensure_geometry(ctx):
 
 
 def _window(audio, ctx, language, decode, t):
-    """One 30 s whisper window: mel -> NPU encoder -> CPU decoder."""
+    """One 30 s whisper window: mel -> NPU encoder -> CPU decoder.
+
+    Returns (text, language). language "auto" is resolved here, on this
+    window's encoder output, and the caller reuses the result for the rest.
+    """
     t0 = time.perf_counter()
     padded = WHISPER.pad_or_trim(audio)
     mel = WHISPER.log_mel_spectrogram(TORCH.from_numpy(padded), n_mels=N_MELS)
@@ -385,13 +431,18 @@ def _window(audio, ctx, language, decode, t):
                       attn_fn=RT.attn_chain, mlp_fn=RT.mlp, fold_bias=True)
     t["encoder_ms"] += (time.perf_counter() - t0) * 1e3
     if not decode:
-        return ""
+        return "", language
+
+    if language == "auto":
+        t0 = time.perf_counter()
+        language = _detect_language(feats, mel)
+        t["detect_ms"] += (time.perf_counter() - t0) * 1e3
 
     t0 = time.perf_counter()
     if CT2 is not None:
         text = CT2.decode(feats, _tokenizer(language))
         t["decoder_ms"] += (time.perf_counter() - t0) * 1e3
-        return text
+        return text, language
     HOLDER["feats"] = TORCH.from_numpy(feats).unsqueeze(0).float()
     opts = WHISPER.DecodingOptions(fp16=False, language=language,
                                    without_timestamps=True, beam_size=None,
@@ -400,7 +451,7 @@ def _window(audio, ctx, language, decode, t):
     r = res[0] if isinstance(res, list) else res
     HOLDER.pop("feats", None)
     t["decoder_ms"] += (time.perf_counter() - t0) * 1e3
-    return r.text
+    return r.text, language
 
 
 def counters():
@@ -468,7 +519,8 @@ def transcribe(audio, ctx, language, decode=True):
     which is what whisper.cpp does too (`-mc 0`); its seek is timestamp-driven,
     so a word straddling a boundary can be split differently here.
     """
-    t = {"mel_ms": 0.0, "encoder_ms": 0.0, "decoder_ms": 0.0, "windows": 0}
+    t = {"mel_ms": 0.0, "encoder_ms": 0.0, "decoder_ms": 0.0, "detect_ms": 0.0,
+         "windows": 0, "language": language}
     if FAIL_INJECT:
         raise RuntimeError("injected NPU failure (NPU_STT_FAIL_INJECT)")
     n_fb = len(RT.fallbacks)
@@ -484,7 +536,9 @@ def transcribe(audio, ctx, language, decode=True):
                 f"{t['truncated_s']:.0f} s dropped (NPU_STT_MAX_WINDOWS)")
             break
         t["windows"] += 1
-        parts.append(_window(chunk, ctx, language, decode, t).strip())
+        text, language = _window(chunk, ctx, language, decode, t)
+        parts.append(text.strip())
+    t["language"] = language
     bump(ctx=ctx)
     t["fallbacks"] = RT.fallbacks[n_fb:]
     if t["fallbacks"]:
@@ -546,6 +600,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] in ("/health", "/healthz"):
             self._json(200, {"status": "ok" if _state["ready"] else "loading",
                              "model": MODEL, "ladder": LADDER,
+                             "default_language": LANG,
+                             "detect_languages": DETECT_LANGS or "any",
+                             "ctx_from_audio": CTX_FROM_AUDIO,
                              "decoder": ({"backend": "ct2",
                                           "compute_type": CT2_COMPUTE,
                                           "threads": CT2_THREADS}
@@ -615,12 +672,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "no 'file' part"})
 
         filename, raw = files["file"]
-        language = (fields.get("language") or LANG).strip() or LANG
+        language = (fields.get("language") or LANG).strip().lower() or LANG
         try:
             req_ctx = int(float(fields.get("audio_ctx") or 0))
         except ValueError:
             req_ctx = 0
-        ctx = ctx_for(req_ctx)
 
         # The original body is kept until the answer is out: falling back means
         # replaying exactly these bytes at whisper.cpp.
@@ -657,6 +713,10 @@ class Handler(BaseHTTPRequestHandler):
             bump("errors")
             return self._json(400, {"error": f"cannot decode audio: {e}"})
         del raw
+        # Sized only now that the audio is decoded: its length is what an
+        # absent audio_ctx stands for when CTX_FROM_AUDIO is on.
+        ctx_src = "client" if req_ctx else ("audio" if CTX_FROM_AUDIO else "default")
+        ctx = ctx_for(req_ctx or (ctx_from_audio(audio.size) if CTX_FROM_AUDIO else 0))
 
         wait = (BUSY_WAIT_MS / 1000.0) if CPU_URL else QUEUE_WAIT_S
         if not _lock.acquire(timeout=wait):
@@ -686,9 +746,11 @@ class Handler(BaseHTTPRequestHandler):
         total = (time.perf_counter() - t_req) * 1e3
         bump("requests", "served_npu")
         del body
-        log(f"ok {audio.size/SR:5.1f}s ctx={req_ctx}->{ctx} win={t['windows']} "
+        log(f"ok {audio.size/SR:5.1f}s ctx={req_ctx or ctx_src}->{ctx} win={t['windows']} "
+            f"lang={language}->{t['language']} "
             f"mel={t['mel_ms']:.0f} enc={t['encoder_ms']:.0f} "
-            f"dec={t['decoder_ms']:.0f} total={total:.0f} ms"
+            + (f"detect={t['detect_ms']:.0f} " if t["detect_ms"] else "")
+            + f"dec={t['decoder_ms']:.0f} total={total:.0f} ms"
             + (f" FALLBACKS={t['fallbacks']}" if t["fallbacks"] else "")
             + (f" [{counters()}]" if _state["requests"] % 25 == 0 else "")
             + (f" :: {text.strip()[:80]}" if LOG_TEXT else ""))
@@ -698,7 +760,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-STT-Path", "npu")
         if t.get("truncated_s"):
             self.send_header("X-STT-Truncated-S", str(round(t["truncated_s"])))
+        self.send_header("X-STT-Language", t["language"])
+        self.send_header("X-NPU-Ctx-Source", ctx_src)
         for k, v in (("X-NPU-Ctx", ctx), ("X-NPU-Mel-Ms", round(t["mel_ms"])),
+                     ("X-NPU-Detect-Ms", round(t["detect_ms"])),
                      ("X-NPU-Enc-Ms", round(t["encoder_ms"])),
                      ("X-NPU-Dec-Ms", round(t["decoder_ms"])),
                      ("X-NPU-Total-Ms", round(total))):
@@ -712,6 +777,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global TORCH, WHISPER, E, RT, MODEL_OBJ, HOLDER, W, N_LAYER, N_HEAD
     log(f"starting on {HOST}:{PORT}, ladder={LADDER}, default_ctx={DEFAULT_CTX}")
+    log(f"language: default={LANG}, auto detects among "
+        f"{','.join(DETECT_LANGS) or 'any'}; ctx_from_audio={CTX_FROM_AUDIO}")
     log(f"cpu fallback: {CPU_URL or 'DISABLED'}"
         + (f", busy_wait={BUSY_WAIT_MS:.0f} ms, timeout={CPU_TIMEOUT:.0f} s"
            if CPU_URL else ""))

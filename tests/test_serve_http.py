@@ -18,6 +18,13 @@ port. What it checks:
                   on any transcript that differs from a recorded run (how the
                   torch and ct2 decoders are compared: the NPU serves one
                   process at a time, so the two runs are sequential)
+  8 language      no language field -> the default /health reports;
+                  language=auto (any case) detects en on jfk.wav, and with
+                  --clips the --language of each clip (detection limited to
+                  /health's detect_languages)
+  9 context       no audio_ctx -> sized to the audio when /health says
+                  ctx_from_audio (never below what the audio needs), else the
+                  full default; a client audio_ctx is used as sent
 
   python3 tests/test_serve_http.py --expect-decoder ct2 --save /tmp/ct2.json
 """
@@ -166,6 +173,49 @@ def main():
             e = wer(ref.read_text(encoding="utf-8"), got)
             check(f"6 {wav.name}: WER {e:.1%} <= {a.max_wer:.0%}", st == 200 and e <= a.max_wer,
                   f"dec {hd.get('X-NPU-Dec-Ms')} ms")
+
+    print("8 language")
+    default_lang = h.get("default_language")
+    check("8 health reports default_language and detect_languages",
+          bool(default_lang) and "detect_languages" in h,
+          f"default={default_lang} detect={h.get('detect_languages')}")
+    st, hd, body = request(a.url, "/inference", {"audio_ctx": "1500"}, jfk)
+    check("8b no language field -> the default language",
+          st == 200 and hd.get("X-STT-Language") == default_lang,
+          f"X-STT-Language={hd.get('X-STT-Language')}")
+    for value in ("auto", "AUTO"):
+        st, hd, body = request(a.url, "/inference", {"language": value, "audio_ctx": "1500"}, jfk)
+        check(f"8c language={value} detects en on jfk.wav",
+              st == 200 and hd.get("X-STT-Language") == "en"
+              and words(body.get("text", "")) == words(EXPECTED)
+              and float(hd.get("X-NPU-Detect-Ms") or 0) > 0,
+              f"HTTP {st} lang={hd.get('X-STT-Language')} detect={hd.get('X-NPU-Detect-Ms')} ms")
+    if a.clips:
+        for wav in sorted(a.clips.glob("*.wav")):
+            ref = wav.with_suffix(".txt")
+            if not ref.exists():
+                continue
+            st, hd, body = request(a.url, "/inference", {"language": "auto"},
+                                   (wav.name, wav.read_bytes()))
+            e = wer(ref.read_text(encoding="utf-8"), body.get("text", ""))
+            check(f"8d {wav.name}: auto detects {a.language}, WER {e:.1%}",
+                  st == 200 and hd.get("X-STT-Language") == a.language and e <= a.max_wer,
+                  f"lang={hd.get('X-STT-Language')}")
+
+    print("9 context")
+    st, hd, _ = request(a.url, "/inference", {"language": "en"}, jfk)
+    src, ctx = hd.get("X-NPU-Ctx-Source"), int(hd.get("X-NPU-Ctx") or 0)
+    if h.get("ctx_from_audio"):
+        # jfk.wav is 11.0 s -> 550 positions needed, 621 with the margin -> 768
+        check("9 no audio_ctx, ctx_from_audio: sized to the audio",
+              st == 200 and src == "audio" and 550 <= ctx < 1500, f"source={src} ctx={ctx}")
+    else:
+        check("9 no audio_ctx: the full default context",
+              st == 200 and src == "default" and ctx == 1500, f"source={src} ctx={ctx}")
+    st, hd, _ = request(a.url, "/inference", {"language": "en", "audio_ctx": "1024"}, jfk)
+    check("9b a client audio_ctx is used as sent",
+          st == 200 and hd.get("X-NPU-Ctx-Source") == "client" and hd.get("X-NPU-Ctx") == "1024",
+          f"source={hd.get('X-NPU-Ctx-Source')} ctx={hd.get('X-NPU-Ctx')}")
 
     if a.save:
         a.save.write_text(json.dumps({"decoder": dec, "transcripts": transcripts},

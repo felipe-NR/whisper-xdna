@@ -62,9 +62,15 @@ services:
       # checkpoint. large-v3 also works; the smaller models are 80-mel and have
       # never been run through the serving path.
       NPU_STT_MODEL: "${NPU_STT_MODEL:-large-v3-turbo}"
-      NPU_STT_LANG: "${NPU_STT_LANG:-ru}"
+      # Language for requests that name none; "auto" in a request detects among
+      # NPU_STT_DETECT_LANGS (empty: any language the checkpoint knows).
+      NPU_STT_LANG: "${NPU_STT_LANG:-en}"
+      NPU_STT_DETECT_LANGS: "${NPU_STT_DETECT_LANGS:-}"
       # Contexts to compile overlays for; a request is rounded up onto them.
       NPU_STT_LADDER: "${NPU_STT_LADDER:-512,768,1024,1280,1500}"
+      # 1: size the context to the audio when the client sends no audio_ctx
+      # (voxtype's remote mode never does) instead of NPU_STT_DEFAULT_CTX.
+      NPU_STT_CTX_FROM_AUDIO: "${NPU_STT_CTX_FROM_AUDIO:-0}"
       # CPU decoder: torch (whisper.decode, fp32) or ct2 (CTranslate2, needs an
       # image built WITH_CT2=1 -- compose.ct2.yml does that). See docs/decoder.md.
       NPU_STT_DECODER: "${NPU_STT_DECODER:-torch}"

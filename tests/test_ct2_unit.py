@@ -22,6 +22,10 @@ run. What each test pins down:
                         full and short ctx; int8: the same words (tiny can flip
                         a comma; exact int8 parity is test_ct2_decoder.py's)
  10 decoder knob        the server refuses an unknown NPU_STT_DECODER
+ 11 language detection  CT2Decoder.language_probs picks what whisper's own
+                        detect_language picks, with close probabilities
+ 12 ctx from audio      the server's ctx_from_audio always covers the audio
+                        (50 positions/s), adds its margin, and is 1500 from 30 s
 
   python3 tests/test_ct2_unit.py            # refenv + ctranslate2 (ct2 image)
 """
@@ -208,6 +212,37 @@ def main():
     check("10 NPU_STT_DECODER=bogus is refused at start",
           r.returncode != 0 and "expected torch or ct2" in (r.stderr + r.stdout),
           f"exit {r.returncode}")
+
+    print("11 language detection")
+    probs = dec.language_probs(full[0].numpy())
+    _, tp = whisper.detect_language(model, full, tok)
+    tp = tp[0]
+    top_ct2, top_torch = max(probs, key=probs.get), max(tp, key=tp.get)
+    check("11 language_probs covers every language token",
+          set(probs) == set(tp), f"{len(probs)} vs {len(tp)}")
+    check("11b same top language as whisper.detect_language on jfk.wav",
+          top_ct2 == top_torch == "en",
+          f"ct2 {top_ct2} {probs[top_ct2]:.3f}, torch {top_torch} {tp[top_torch]:.3f}")
+    check("11c probabilities close (int8 vs fp32)",
+          abs(probs["en"] - tp["en"]) < 0.05, f"|delta| {abs(probs['en'] - tp['en']):.4f}")
+
+    print("12 ctx from audio")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("srv", ROOT / "serve" / "npu_stt_server.py")
+    srv = importlib.util.module_from_spec(spec)
+    cwd = os.getcwd()
+    try:
+        spec.loader.exec_module(srv)       # module level only; main() is not run
+    finally:
+        os.chdir(cwd)
+    sr = srv.SR
+    cases = {0.5: 44, 5.95: 344, 11.0: 621, 29.9: 1500, 30.0: 1500, 45.0: 1500}
+    got = {s: srv.ctx_from_audio(int(s * sr)) for s in cases}
+    check("12 ctx_from_audio: 50/s with a 10% + 16 margin, 1500 from 30 s",
+          got == cases, f"{got}")
+    covers = all(srv.ctx_for(srv.ctx_from_audio(int(s * sr))) >= min(1500, s * 50)
+                 for s in (0.1, 1, 3, 7.3, 10.2, 13, 19.9, 25.5, 29.99, 31, 60))
+    check("12b rounded onto the ladder it never covers less than the audio", covers)
 
     failed = [n for n, ok in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} passed"
