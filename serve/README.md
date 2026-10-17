@@ -210,6 +210,59 @@ resolve numpy replaces refenv's with one numba refuses to import. The build
 then checks that refenv is exactly the lock files (see "Pinned versions" in
 the top-level README).
 
+## Language and context for clients that send neither
+
+Some clients send neither `language` nor `audio_ctx`. voxtype's `remote` mode
+is one: captured on the wire, it posts to `/v1/audio/transcriptions` with
+`model=whisper-1`, `response_format=json` and **one** language. That is the
+first entry of its `language` list, nothing at all for `"auto"`, or `auto`
+with `remote_send_auto_language = true`. It never sends `audio_ctx`.
+
+| variable | default | |
+|---|---|---|
+| `NPU_STT_LANG` | `en` (was `ru`) | Language for a request that names none. An absent language is **not** detection. |
+| `NPU_STT_DETECT_LANGS` | empty (any) | `language=auto` (any case) detects on the first window's encoder output, among these codes (e.g. `pt,en`), and later windows reuse the result. It costs 15-35 ms, because the encoder output is already there. |
+| `NPU_STT_CTX_FROM_AUDIO` | `0` | `1`: with no `audio_ctx`, size the context to the decoded audio (50 positions/s, +10% +16, onto the ladder; 1500 from 30 s) instead of `NPU_STT_DEFAULT_CTX`. Never below what the audio needs. |
+
+Every response says what was used: `X-STT-Language`, `X-NPU-Ctx`,
+`X-NPU-Ctx-Source` (`client` / `audio` / `default`) and `X-NPU-Detect-Ms`.
+`/health` reports `default_language`, `detect_languages` and `ctx_from_audio`.
+
+voxtype on this service (`~/.config/voxtype/config.toml`):
+
+```toml
+[whisper]
+mode = "remote"
+remote_endpoint = "http://127.0.0.1:8090"
+remote_send_auto_language = true
+language = "auto"         # with NPU_STT_DETECT_LANGS=pt,en on the service
+```
+
+Measured through voxtype itself (`voxtype -v transcribe`, its own "completed
+in" times), against voxtype's local Vulkan backend on the Radeon 780M, with the
+same pt/en switching on both sides. Ryzen 7 8700G, `large-v3-turbo`, ct2
+decoder, a mixed sequence of 8 phrases:
+
+| phrase | iGPU, pt/en detection | iGPU, language fixed | NPU, pt/en detection |
+|---|---|---|---|
+| 6 s pt, same length as the previous one | 2.55-2.60 s | 1.46 s | **1.35 s** |
+| 6 s pt, after a phrase of another length | 2.55-2.60 s | 1.46 s | 2.21-2.23 s |
+| 11 s en (`jfk.wav`) | 2.50-2.56 s | 1.46 s | 2.90 s |
+| 20 s pt | 2.83-2.84 s | — | 4.26-4.29 s |
+| the 8 phrases | 21.05 s | — | 21.52 s |
+
+- **Language detection is what separates the two.** voxtype's local
+  constrained detection costs ~1.1 s on the iGPU: it logs the detection 1.1 s
+  after starting, then transcribes. Here detection rides on the encoder pass
+  that transcription needs anyway.
+- **Context switches cost ~0.6-0.85 s.** A request whose length falls in a
+  different ladder step than the previous one re-uploads the geometry (encoder
+  1.8 s instead of 1.2 s at ctx 512). Short phrases in a row stay at 1.35 s.
+- **Long phrases are still the iGPU's.** At 20 s the NPU encoder alone is
+  ~3.1 s, plus the switch.
+- voxtype does **not** fall back to its local backend when the service is
+  down: the request fails with `Connection refused` and the dictation is lost.
+
 ## Known limits
 
 - Speech longer than 30 s is windowed with a fixed stride, while `whisper.cpp`
