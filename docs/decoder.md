@@ -116,20 +116,24 @@ tokens; a integração precisa revalidar a transcrição de ponta a ponta.
 | [`bench/probe_decoder_ct2.py`](../bench/probe_decoder_ct2.py) | CTranslate2 `generate()` sobre o mesmo encoder output, por `compute_type` |
 | [`tools/compare_dictation.py`](../tools/compare_dictation.py) | Ponta a ponta: voxtype/Vulkan contra o serviço da NPU |
 
+As medições acima foram feitas na imagem `kostryukov/npu-whisper:1.3.4`, com o
+CTranslate2 instalado à parte. Para reproduzir hoje, use a imagem do serviço
+(`npu-whisper:ct2`, construída pelo `compose.ct2.yml`), que já traz o
+CTranslate2 e o mesmo `refenv`, travado pelo lock:
+
 ```bash
-# PyTorch: imagem do serviço, container descartável
+# PyTorch
 docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
   -v $PWD/bench:/b:ro -v ~/Projects/npu-bench-audio:/a:ro \
-  --entrypoint /opt/refenv/bin/python kostryukov/npu-whisper:1.3.4 \
+  --entrypoint /opt/refenv/bin/python npu-whisper:ct2 \
   -W ignore /b/probe_decoder_cpu.py --threads 16,8 /a/pt-curto.wav /a/pt-longo.wav
 
-# CTranslate2: --no-deps, senão o pip troca o numpy da imagem e quebra o numba
+# CTranslate2 (modelo convertido em /ct2)
 docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
   -v $PWD/bench:/b:ro -v ~/Projects/bench-tools/ct2-turbo:/ct2:ro \
-  -v ~/Projects/npu-bench-audio:/a:ro --entrypoint bash kostryukov/npu-whisper:1.3.4 -c '
-  /opt/refenv/bin/python -m pip install -q --no-deps --target /tmp/ct2 ctranslate2==4.8.2 &&
-  PYTHONPATH=/tmp/ct2 /opt/refenv/bin/python -W ignore /b/probe_decoder_ct2.py \
-    --ct2 /ct2 --compute-types float32,int8 --threads 8 /a/pt-curto.wav /a/pt-longo.wav'
+  -v ~/Projects/npu-bench-audio:/a:ro --entrypoint /opt/refenv/bin/python npu-whisper:ct2 \
+  -W ignore /b/probe_decoder_ct2.py --ct2 /ct2 --compute-types float32,int8 \
+  --threads 8 /a/pt-curto.wav /a/pt-longo.wav
 ```
 
 - Modelo CTranslate2 usado: `deepdml/faster-whisper-large-v3-turbo-ct2`
@@ -142,30 +146,101 @@ docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
   AVX512_BF16 = 1`. Greedy: `whisper-cli -bs 1 -bo 1 -t 8 -l pt`. Os passos por
   token entram em `decode time`; o `batchd` é só o prompt.
 
-## Plano de refatoração (proposto, não implementado)
+## Plano de refatoração
 
 1. ~~**Fase 0, trivial:** `NPU_STT_TORCH_THREADS=8`.~~ Retirada: o ganho só
    aparece no probe isolado. No serviço, 16 threads tem a mesma parede e gasta
    menos CPU ([U9](upstream-validation.md#u9-threads)).
-2. **Fase 1, decoder em CTranslate2 int8** em `serve/npu_stt_server.py`:
-   - Uma variável `NPU_STT_DECODER=torch|ct2`, com `torch` como padrão para
-     manter o comportamento do upstream.
-   - Em `_window`: `ct2.generate(StorageView.from_array(feats[None]),
-     [sot_sequence_including_notimestamps], beam_size=1)` no lugar de
-     `WHISPER.decode`, e o texto via `tokenizer.decode(sequences_ids[0])`.
-   - **Mesmo checkpoint.** O upstream alerta que encoder e decoder de
-     checkpoints diferentes "confabulam" sem dar erro. Converter o modelo
-     CTranslate2 a partir do **mesmo** `large-v3-turbo` (com
-     `ct2-transformers-converter --quantization int8`) e registrar o hash, em
-     vez de depender de um modelo de terceiros.
-   - Sem o decoder torch, o modelo torch só serviria para extrair os pesos do
-     encoder no start, e o processo pode soltá-lo: menos RAM residente que os
-     ~8–9 GB de hoje.
-   - Imagem: `ctranslate2` no `refenv` (ou numa venv nova), fixando a versão do
-     numpy compatível com o numba do openai-whisper.
-   - Aceitação: `tests/` mais transcrição idêntica (ou diferença justificada)
-     contra o caminho torch nos clipes de referência, com o encoder **da NPU**.
+2. **Fase 1, decoder em CTranslate2 int8: implementada** (branch
+   `feat/ct2-decoder`; uso e opções em
+   [`serve/README.md`](../serve/README.md#decoder-torch-or-ctranslate2)).
 3. **Fase 2, opcional:** decoder torch em bf16 como fallback sem dependência
-   nova (2,3×), caso o CTranslate2 não entre na imagem.
-4. **Fora do escopo do decoder:** o encoder passa a ser o gargalo (int8 nos
-   GEMMs, ctx dinâmico no cliente).
+   nova (2,3×), caso o CTranslate2 não entre na imagem. Não feita.
+4. **Fora do escopo do decoder:** com o ct2, o encoder volta a ser o gargalo
+   (int8 nos GEMMs, ctx dinâmico no cliente).
+
+## Implementação (fase 1)
+
+### O que mudou
+
+| Arquivo | Mudança |
+|---|---|
+| `serve/ct2_decoder.py` | Conversor próprio (checkpoint openai → `WhisperSpec` do CTranslate2), cache por SHA-256 e `CT2Decoder.decode()` |
+| `serve/npu_stt_server.py` | `NPU_STT_DECODER=torch\|ct2` (padrão `torch`), `NPU_STT_CT2_COMPUTE`, `NPU_STT_CT2_THREADS`, `NPU_STT_CT2_DIR`; o `_window` decodifica com o ct2 quando ativo; o `/health` informa o decoder |
+| `Dockerfile` | `WITH_CT2=1`: `ctranslate2==4.8.2` e `PyYAML==6.0.2` no `refenv` via `--no-deps`; o `refenv` inteiro travado por `requirements/refenv.lock.txt`, com diff do `pip freeze` no build |
+| `requirements/` | `refenv.lock.txt` (o `refenv` exato da imagem validada) e `refenv-ct2.lock.txt` |
+| `compose.yml`, `compose.ct2.yml` | As novas variáveis e o volume `ct2` para o cache; o `compose.ct2.yml` constrói o `stt` com `WITH_REFERENCE=1 WITH_CT2=1` e define os serviços de teste |
+| `tests/` | `test_ct2_decoder.py`, `test_ct2_unit.py`, `test_serve_http.py`, `test_compare_dictation.py` e `run_all.sh` ([tests/README.md](../tests/README.md)) |
+| `.dockerignore` | `.env` local fora das imagens |
+
+A primeira versão usava um Dockerfile sobreposto (`serve/ct2.Dockerfile`), que
+instalava o CTranslate2 por cima da imagem publicada `kostryukov/npu-whisper`.
+Ele foi removido quando o `WITH_CT2=1` do `Dockerfile` principal passou na
+suíte completa: duplicava a instalação e dependia de uma imagem de terceiros.
+
+### Onde a implementação divergiu do plano, e por quê
+
+- **Sem `ct2-transformers-converter` nem download do Hugging Face.** O
+  `transformers` já está na série 5.x, e a compatibilidade com o conversor do
+  CTranslate2 4.8.2 era incerta. Em vez disso, o `WhisperSpec` é preenchido
+  direto dos módulos do openai-whisper, espelhando o `WhisperLoader` do
+  CTranslate2. Assim, "mesmo checkpoint" vale por construção. Validação
+  cruzada contra o modelo convertido pelo caminho oficial
+  (`deepdml/faster-whisper-large-v3-turbo-ct2`): **vocabulário (51 866 ids),
+  `suppress_ids`, `suppress_ids_begin` e `lang_ids` idênticos**.
+- **Conversão automática no primeiro start**, com cache indexado pelo SHA-256
+  do checkpoint (o mesmo que o openai-whisper confere ao carregar), em vez de
+  um passo manual.
+- **Três problemas encontrados e medidos no caminho:**
+  1. **A quantização int8 do CTranslate2 altera os pesos que recebe.** O
+     `_quantize` faz `value = value.to("float32").numpy(); value *= scale`.
+     Para tensores fp32, o `.to()` não copia e o `.numpy()` compartilha a
+     memória, então os parâmetros torch eram reescalados (|Δ| até 127 no
+     embedding, `conv1` e `fc1`; só q/k/v escapavam, por serem concatenados).
+     O sintoma foi lixo nos **dois** decoders, porque o encoder de referência
+     também estava corrompido. Correção: o conversor clona cada tensor, e o
+     teste verifica que o `state_dict` sai intacto.
+  2. **A conversão em processo deixava ~3 GB residentes.** Foram 11,0 GiB
+     contra 8,0 GiB com cache, e o `malloc_trim(0)` não devolveu a memória.
+     Correção: a conversão roda num processo filho, que devolve tudo ao sair
+     (custo de ~6 s, só no primeiro start).
+  3. **`max_length` conta em dobro.** `Whisper.generate` devolve
+     `max_length // 2` tokens (medido: 224 → 112, 448 → 224). O decoder passa
+     448 para parar no mesmo ponto que os 224 tokens do `whisper.decode`.
+- **Não precisou fixar o numpy:** `--no-deps` mantém o numpy 2.4.6 do
+  `refenv`. Deixar o pip resolver dependências instala o numpy 2.5, que o
+  numba recusa.
+
+### Validação
+
+A suíte automatizada (`tests/run_all.sh`, descrita em
+[`tests/README.md`](../tests/README.md)) cobre tudo abaixo e também a
+**suíte da NPU do repositório** (`test_rowops`, `test_chain_acc` e
+`test_encoder_golden` 14/14, bit a bit), que passa neste host com a imagem
+`ct2`. Em resumo:
+
+- **CPU, contra o `whisper.decode`** (`tests/test_ct2_decoder.py`, imagem
+  `npu-whisper:ct2`): 3 clipes (jfk/en, curto/pt, longo/pt) × ctx 1500/1280/512
+  = **9/9 com texto idêntico**. Inclui os dois casos em que o clipe é maior
+  que o contexto, em que **os dois decoders entram no mesmo loop e param no
+  mesmo token**. Para ctx < 1500, o teste reproduz o que a NPU faz: encoda só
+  as primeiras `2·ctx` frames do mel contra `ctx` posições (como o `-ac` do
+  whisper.cpp), em vez de cortar um encoding de 1500 posições.
+- **Ponta a ponta com o encoder bf16 na NPU** (`tools/compare_dictation.py` e
+  headers `X-NPU-*`): as 4 transcrições (2 clipes × ctx auto/1500) são
+  **idênticas às do backend torch**.
+- **Regressão do caminho torch:** com `NPU_STT_DECODER=torch`, a mesma imagem
+  dá 1807 / 4548 ms e o mesmo texto de antes da mudança.
+
+### Resultado medido (serviço, `large-v3-turbo`, `pt`, mediana de 3)
+
+| Clipe | torch: dec / total | **ct2: dec / total** | iGPU (voxtype) | CPU por requisição | Memória do container |
+|---|---|---|---|---|---|
+| curto, ctx=512 | 599 / 1767 ms | **142 / 1331 ms** | 1460 ms | 1,35 → 1,21 s | 8,3 → 8,0 GiB |
+| longo, ctx=1280 | 1414 / 4487 ms | **365 / 3454 ms** | 1720 ms | 3,47 → 2,95 s | |
+
+- **Na frase curta, o caminho NPU passa a ser mais rápido que a iGPU**
+  (1,33 contra 1,46 s). Na longa, a iGPU continua 2× à frente: o encoder na NPU
+  (~3,1 s em ctx ≥ 1280) virou o gargalo.
+- O decoder ficou 4,2× (curto) e 3,9× (longo) mais rápido no serviço, perto
+  dos 4,4–4,7× do probe.

@@ -38,6 +38,9 @@ x-npu: &npu
     # directory of your own if you want to look inside.
     - aot:/opt/npu-whisper/aot
     - models:/root/.cache/whisper
+    # CTranslate2 decoder converted from the checkpoint above, keyed by its
+    # SHA-256 (NPU_STT_DECODER=ct2 only; seconds to rebuild, but no reason to).
+    - ct2:/root/.cache/npu-whisper
 
 services:
   npu-whisper:
@@ -62,6 +65,12 @@ services:
       NPU_STT_LANG: "${NPU_STT_LANG:-ru}"
       # Contexts to compile overlays for; a request is rounded up onto them.
       NPU_STT_LADDER: "${NPU_STT_LADDER:-512,768,1024,1280,1500}"
+      # CPU decoder: torch (whisper.decode, fp32) or ct2 (CTranslate2, needs an
+      # image built WITH_CT2=1 -- compose.ct2.yml does that). See docs/decoder.md.
+      NPU_STT_DECODER: "${NPU_STT_DECODER:-torch}"
+      NPU_STT_CT2_COMPUTE: "${NPU_STT_CT2_COMPUTE:-int8}"
+      NPU_STT_CT2_THREADS: "${NPU_STT_CT2_THREADS:-8}"
+      NPU_STT_TORCH_THREADS: "${NPU_STT_TORCH_THREADS:-16}"
       # Other NPU_STT_* knobs (see serve/npu_stt_server.py) go here too — the
       # container sees only what this block passes through.
     # No restart policy by default: under serve/units/npu-stt.service systemd is
@@ -72,3 +81,4 @@ services:
 volumes:
   aot:
   models:
+  ct2:

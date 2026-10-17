@@ -1,0 +1,7 @@
+# Added to refenv for NPU_STT_DECODER=ct2 (serve/ct2_decoder.py), --no-deps:
+# letting pip resolve ctranslate2's numpy requirement can replace refenv's
+# numpy with one numba refuses to import. PyYAML is the one dependency of
+# ctranslate2's converter package that refenv does not already carry.
+# Used by both Dockerfile (WITH_CT2=1) and serve/ct2.Dockerfile.
+ctranslate2==4.8.2
+PyYAML==6.0.2

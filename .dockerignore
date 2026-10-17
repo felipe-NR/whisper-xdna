@@ -17,3 +17,5 @@ __pycache__/
 .git/
 # audio brought in for testing — never ship it in the image
 samples/
+# host-local compose settings, never part of an image
+.env

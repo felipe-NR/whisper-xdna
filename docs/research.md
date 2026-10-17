@@ -233,6 +233,10 @@ Outras observações:
 1. **Para ditado interativo, a iGPU vence.** É de 1,25× (frase curta) a 2,7×
    (20 s) mais rápida, usa metade da CPU e é estável. Fica como o padrão do
    voxtype.
+   **Atualização:** com o decoder CTranslate2 int8
+   (`NPU_STT_DECODER=ct2`, ver [decoder.md](decoder.md#implementação-fase-1)),
+   a NPU passa à frente na frase curta (1,33 contra 1,46 s) e fica em 3,45
+   contra 1,72 s no áudio de 20 s, com o mesmo texto.
 2. **A NPU XDNA1 funciona de verdade neste host** com o whisper-xdna (firmware
    1.5.5.391, kernel 7.2.5) e entrega a mesma qualidade, mas a latência sobe
    para 1,8–4,6 s, sem ganho de CPU. Faz sentido como experimento, ou para

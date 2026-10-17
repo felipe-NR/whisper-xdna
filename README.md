@@ -427,7 +427,9 @@ carries a second service, `stt`, which starts the HTTP endpoint instead of a
 shell. The reference
 environment (torch + openai-whisper + ffmpeg, ~1.9 GB) is off by default; the
 tools under `tools/` and everything in `serve/` need it, so add it with
-`--build-arg WITH_REFERENCE=1`.
+`--build-arg WITH_REFERENCE=1`. `--build-arg WITH_CT2=1` (with
+`WITH_REFERENCE=1`) adds the CTranslate2 decoder `serve/` can use instead of
+torch's; see [serve/README.md](serve/README.md#decoder-torch-or-ctranslate2).
 
 Two sanity checks, in order — the first needs no NPU, the second does:
 
@@ -439,6 +441,47 @@ docker run --rm --device /dev/accel/accel0 --device /dev/dri \
   python3 -c "import pyxrt; print(pyxrt.device(0).get_info(pyxrt.xrt_info_device.name))"
 # expected: RyzenAI-npu1
 ```
+
+### Pinned versions
+
+`torch` and `openai-whisper` used to be installed unpinned, so every rebuild
+resolved whatever was newest that day and could drift from the image the tests
+passed on. The Python half of the serving image is now locked to exactly what
+was in that image. Everything that the lock does not cover is listed too.
+
+| Component | Version | Pinned how |
+|---|---|---|
+| `refenv` (torch, openai-whisper and the 22 packages under them) | `torch==2.13.0+cpu`, `openai-whisper==20250625`, `numpy==2.4.6`, `numba==0.66.0`, `ml_dtypes==0.5.4`, … | **Exact.** [`requirements/refenv.lock.txt`](requirements/refenv.lock.txt) is the `pip freeze` of `/opt/refenv` in `kostryukov/npu-whisper:1.3.4` (2026-07-26), installed with `--no-deps`. The build then diffs `pip freeze` against it and fails on any difference. `triton` is left out on purpose. |
+| CTranslate2 decoder (`WITH_CT2=1`, which `compose.ct2.yml` sets) | `ctranslate2==4.8.2`, `PyYAML==6.0.2` | **Exact.** [`requirements/refenv-ct2.lock.txt`](requirements/refenv-ct2.lock.txt), installed with `--no-deps`, checked by the same diff. |
+| MLIR-AIE / IRON | `mlir-aie` 1.3.4 (wheel + checkout) | **Exact**, by `ARG MLIR_AIE_VERSION`. |
+| peano (`llvm-aie`) | `21.0.0.2026062301+cb664e8c` | **Exact**, by MLIR-AIE v1.3.4's own `utils/peano-requirements.txt`. |
+| The rest of `ironenv` | e.g. `numpy==2.5.1` in the reference image | **Not exact.** It comes from MLIR-AIE's `python/requirements*.txt`, which use ranges. |
+| XRT | `2.25.0-4~bpo13+1` in the 2026-10-17 build, `2.21.75+dfsg-9~bpo13+1` in the July one (`libxrt-npu2`, `python3-xrt`) | **Not pinned.** It is whatever trixie-backports carries. Backports keeps only its latest version, so pinning it would break the build the day it moves. `tests/test_encoder_golden.py` (bit-identical golden, recorded on XRT 2.21.75) is what notices. |
+| Base images, Python | `debian:13`, `debian:13-slim` (Python 3.13.5 at the reference build) | **Not pinned.** Tags, not digests. |
+
+To move a version: edit the lock, rebuild, run
+[`tests/run_all.sh`](tests/README.md), and update this table.
+
+Builds validated with the full suite (`tests/run_all.sh`: every stage
+passed, including the bit-identical encoder golden), on a Ryzen 7 8700G with
+NPU firmware 1.5.5.391:
+
+| Image | Built | `refenv` | XRT | Rest of `ironenv` |
+|---|---|---|---|---|
+| `kostryukov/npu-whisper:1.3.4`, with CTranslate2 layered on by an overlay Dockerfile that has since been removed | 2026-07-26 | the lock | 2.21.75+dfsg-9~bpo13+1 | `numpy` 2.5.1, `ml_dtypes` 0.5.4 |
+| `Dockerfile`, `WITH_REFERENCE=1 WITH_CT2=1`, commit `ea33950`, cached build | 2026-10-17 | the lock, identical (`pip freeze` diff empty) | **2.25.0-4~bpo13+1** | `numpy` 2.5.4, `ml_dtypes` 0.6.0, and ~40 notebook/tooling packages moved |
+| the same, via `compose.ct2.yml`, commit `75b52ee`, `--no-cache` (202 s) | 2026-10-17 | the lock, identical | 2.25.0-4~bpo13+1 | as above |
+
+Three months were enough for trixie-backports to replace XRT 2.21.75 with
+2.25.0. Encoder output stayed bit-identical, and timings stayed within noise
+(the 20 s clip's encoder: ~3100 → 3040 ms). The unpinned rows above are where a
+future rebuild can change things.
+
+The serving image used to come in two recipes: this `Dockerfile`, and an
+overlay that added CTranslate2 to an already-built image. The overlay needed a
+third-party base and duplicated the install, so it was removed once
+`WITH_CT2=1` passed the suite here. To skip the build, point `NPU_WHISPER_IMAGE`
+at an image you have already built.
 
 ## Serving it
 

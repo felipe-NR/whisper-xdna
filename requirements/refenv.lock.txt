@@ -1,0 +1,38 @@
+# refenv: the serving/reference venv (torch + openai-whisper), pinned exactly.
+#
+# This is `pip freeze --all --exclude pip` of /opt/refenv in the image every
+# test in tests/README.md passed on: kostryukov/npu-whisper:1.3.4 (built
+# 2026-07-26, Python 3.13.5). The Dockerfile installs it with --no-deps, so the
+# venv is this list and nothing else, and then checks that it is.
+#
+# triton is absent on purpose: openai-whisper asks for it on x86_64 Linux, but
+# it is a GPU compiler nothing here can use (the Dockerfile has always removed
+# it), which is also why `pip check` reports it missing.
+#
+# torch's +cpu build comes from https://download.pytorch.org/whl/cpu (passed
+# as --extra-index-url). To move a version: change it here, rebuild, run
+# tests/run_all.sh, and record the new set in README.md ("Pinned versions").
+certifi==2026.7.22
+charset-normalizer==3.4.9
+filelock==3.32.0
+fsspec==2026.6.0
+idna==3.18
+Jinja2==3.1.6
+llvmlite==0.48.0
+MarkupSafe==3.0.3
+ml_dtypes==0.5.4
+more-itertools==11.1.0
+mpmath==1.3.0
+networkx==3.6.1
+numba==0.66.0
+numpy==2.4.6
+openai-whisper==20250625
+regex==2026.7.19
+requests==2.34.2
+setuptools==83.0.0
+sympy==1.14.0
+tiktoken==0.13.0
+torch==2.13.0+cpu
+tqdm==4.69.1
+typing_extensions==4.16.0
+urllib3==2.7.0

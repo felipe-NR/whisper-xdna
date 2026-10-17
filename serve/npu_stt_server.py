@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """STT over the XDNA1 NPU encoder, speaking whisper.cpp's HTTP contract.
 
-Pipeline: multipart audio -> ffmpeg/wav -> log-mel -> NPU encoder -> torch
-CPU decoder (large-v3-turbo) -> {"text": ...}.
+Pipeline: multipart audio -> ffmpeg/wav -> log-mel -> NPU encoder -> CPU
+decoder (large-v3-turbo) -> {"text": ...}. The decoder is torch by default, or
+CTranslate2 with NPU_STT_DECODER=ct2 (serve/ct2_decoder.py).
 
 Runs in refenv, which is where torch and openai-whisper live. rawxrt needs only
 numpy, ml_dtypes and pyxrt at run time -- it shells out to ironenv for AOT
@@ -30,6 +31,7 @@ outer half stays in the client, which goes to the whisper.cpp endpoint on its
 own when this service is not answering at all; a fallback that lives only in
 here dies with the process it lives in.
 """
+import functools
 import json
 import os
 import re
@@ -79,6 +81,21 @@ DEFAULT_CTX = int(os.environ.get("NPU_STT_DEFAULT_CTX", "1500"))
 # burns is not, and 16 costs the least (6.2 CPU-s on the 22.6 s sample against
 # 9.0 at four and 15.9 at eight).
 TORCH_THREADS = int(os.environ.get("NPU_STT_TORCH_THREADS", "16"))
+# Which CPU decoder turns the NPU's encoder output into text. "torch" is
+# whisper.decode in fp32, as above. "ct2" is CTranslate2 (serve/ct2_decoder.py),
+# converted on first start from the same loaded checkpoint and cached by its
+# SHA-256: int8 on 8 threads decodes the same text 4.4-4.7x faster on a
+# Ryzen 7 8700G (docs/decoder.md, tests/test_ct2_decoder.py).
+DECODER = os.environ.get("NPU_STT_DECODER", "torch").strip().lower()
+if DECODER not in ("torch", "ct2"):
+    raise SystemExit(f"NPU_STT_DECODER={DECODER!r}: expected torch or ct2")
+CT2_COMPUTE = os.environ.get("NPU_STT_CT2_COMPUTE", "int8").strip()
+# Measured in this service on an 8-core/16-thread part, unlike torch above: 8
+# matches 16 on wall clock (142 vs 143 ms decoding 6 s of speech) and burns 40%
+# less CPU (1.21 vs 2.00 s per request); 4 saves another 17% for +43 ms.
+CT2_THREADS = int(os.environ.get("NPU_STT_CT2_THREADS", "8"))
+CT2_DIR = os.environ.get("NPU_STT_CT2_DIR",
+                         os.path.expanduser("~/.cache/npu-whisper/ct2"))
 # A queued request must not outlive the client, which typically gives it 30 s.
 QUEUE_WAIT_S = float(os.environ.get("NPU_STT_QUEUE_WAIT", "20"))
 MAX_BODY = int(os.environ.get("NPU_STT_MAX_BODY", str(64 << 20)))
@@ -203,6 +220,24 @@ def load_backend():
     E.gelu = rt.gelu                       # what --npu-gelu does
     log("encoder weights resident on device")
 
+    global CT2, TOK_ARGS
+    TOK_ARGS = {"multilingual": model.is_multilingual,
+                "num_languages": model.num_languages}
+    if DECODER == "ct2":
+        # Cached under the SHA-256 of the checkpoint just loaded, and converted
+        # from that same file (in a child, see ensure_model) when absent, so
+        # encoder and decoder cannot come from different checkpoints. From here
+        # on nothing needs the torch model.
+        import ct2_decoder
+        out = ct2_decoder.ensure_model(
+            MODEL, CT2_DIR, quantization=CT2_COMPUTE.split("_")[0], log=log)
+        CT2 = ct2_decoder.CT2Decoder(out, compute_type=CT2_COMPUTE,
+                                     threads=CT2_THREADS)
+        del model
+        log(f"ct2 decoder ready ({CT2_COMPUTE}, {CT2_THREADS} threads), "
+            "torch model dropped")
+        return torch, whisper, E, rt, None, {}, W, n_layer, n_head
+
     holder = {}
 
     class _Stub(torch.nn.Module):
@@ -223,6 +258,14 @@ def load_backend():
 
 TORCH = WHISPER = E = RT = MODEL_OBJ = HOLDER = W = None
 N_LAYER = N_HEAD = 0
+CT2 = None            # ct2_decoder.CT2Decoder when NPU_STT_DECODER=ct2
+TOK_ARGS = {}         # what get_tokenizer needs from the checkpoint
+
+
+@functools.lru_cache(maxsize=None)
+def _tokenizer(language):
+    from whisper.tokenizer import get_tokenizer
+    return get_tokenizer(language=language, task="transcribe", **TOK_ARGS)
 
 
 def ctx_for(requested):
@@ -345,6 +388,10 @@ def _window(audio, ctx, language, decode, t):
         return ""
 
     t0 = time.perf_counter()
+    if CT2 is not None:
+        text = CT2.decode(feats, _tokenizer(language))
+        t["decoder_ms"] += (time.perf_counter() - t0) * 1e3
+        return text
     HOLDER["feats"] = TORCH.from_numpy(feats).unsqueeze(0).float()
     opts = WHISPER.DecodingOptions(fp16=False, language=language,
                                    without_timestamps=True, beam_size=None,
@@ -499,6 +546,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] in ("/health", "/healthz"):
             self._json(200, {"status": "ok" if _state["ready"] else "loading",
                              "model": MODEL, "ladder": LADDER,
+                             "decoder": ({"backend": "ct2",
+                                          "compute_type": CT2_COMPUTE,
+                                          "threads": CT2_THREADS}
+                                         if DECODER == "ct2" else
+                                         {"backend": "torch",
+                                          "threads": TORCH_THREADS}),
                              "resident_ctx": _state["ctx"],
                              "max_windows": MAX_WINDOWS,
                              "requests": _state["requests"],

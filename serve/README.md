@@ -144,16 +144,85 @@ of speech, so long audio wants a longer timeout on the caller's side.
 rather than holding the device indefinitely; the response then carries
 `X-STT-Truncated-S` with the number of seconds dropped, and the log says so.
 
+## Decoder: torch or CTranslate2
+
+The decoder runs on the CPU either way. `NPU_STT_DECODER` picks which one:
+
+- `torch` (default): `whisper.decode` in fp32, as before.
+- `ct2`: CTranslate2 in int8 (`serve/ct2_decoder.py`). Same text, a quarter of
+  the bytes per weight on a load that is bound by memory bandwidth.
+
+Measured on a Ryzen 7 8700G, `large-v3-turbo`, `pt`, the service's own
+`X-NPU-*` headers, median of 3 warm requests:
+
+| clip | `audio_ctx` | torch: decoder / total | ct2: decoder / total | CPU per request, torch → ct2 |
+|---|---|---|---|---|
+| 6 s | 512 | 599 / 1767 ms | **142 / 1331 ms** | 1.35 → 1.21 s |
+| 20 s | 1280 | 1414 / 4487 ms | **365 / 3454 ms** | 3.47 → 2.95 s |
+
+The transcripts were identical on every request. `tests/test_ct2_decoder.py`
+checks that on CPU against `whisper.decode` for 3 clips × 3 contexts, including
+two where both decoders loop, and stop on the same token.
+
+```bash
+# compose.ct2.yml builds stt from Dockerfile with WITH_REFERENCE=1 WITH_CT2=1
+# and sets NPU_STT_DECODER=ct2
+RENDER_GID=$(getent group render | cut -d: -f3) VCS_REF=$(git rev-parse HEAD) \
+  docker compose -f compose.yml -f compose.ct2.yml up -d --build stt
+```
+
+To make that the default for every `docker compose` call in the checkout, put
+`COMPOSE_FILE=compose.yml:compose.ct2.yml` in `.env`. The build is the full
+`Dockerfile` (measured: 202 s from nothing with `--no-cache` on a Ryzen 7
+8700G, base images already pulled). `VCS_REF` becomes the image's
+`org.opencontainers.image.revision`. Tests:
+[`tests/README.md`](../tests/README.md).
+
+How it works:
+
+- **One checkpoint, by construction.** There is no downloaded "converted
+  model". On the first start the decoder is converted from the checkpoint the
+  service loaded and cached in the `ct2` volume under that file's SHA-256 (~2 s
+  of conversion, ~6 s with the child process that does it). Every later start
+  loads the cache.
+- **The conversion runs in a child process.** In-process, the allocator kept
+  the conversion's ~3 GB of fp32 scratch: 11.0 GiB resident against 8.0 GiB,
+  and `malloc_trim` did not return it.
+- **The conversion copies every tensor.** CTranslate2's int8 quantisation
+  rescales the arrays it is handed in place, and for fp32 torch parameters
+  those share memory with the model. Measured: |Δ| up to 127 on the token
+  embedding, `conv1` and `fc1` until the converter cloned them.
+- **Decoding options mirror `whisper.decode`.** Greedy, no timestamps, the
+  `"-1"` non-speech set, blank suppression on the first step, at most 224 new
+  tokens. CTranslate2's `max_length` counts double (it returns
+  `max_length // 2` tokens), so the call passes 448.
+
+| variable | default | |
+|---|---|---|
+| `NPU_STT_DECODER` | `torch` | `torch` or `ct2` |
+| `NPU_STT_CT2_COMPUTE` | `int8` | any CPU compute type ctranslate2 offers: `int8`, `int8_float32`, `float32` |
+| `NPU_STT_CT2_THREADS` | `8` | Measured in the service: 8 matches 16 on wall clock (142 vs 143 ms) at 40% less CPU (1.21 vs 2.00 s/request); 4 saves another 17% CPU for +43 ms |
+| `NPU_STT_CT2_DIR` | `~/.cache/npu-whisper/ct2` | the `ct2` volume in `compose.yml` |
+
+In the image, `WITH_CT2=1` puts `ctranslate2` and `PyYAML` into refenv from
+`requirements/refenv-ct2.lock.txt` with `--no-deps`, because letting pip
+resolve numpy replaces refenv's with one numba refuses to import. The build
+then checks that refenv is exactly the lock files (see "Pinned versions" in
+the top-level README).
+
 ## Known limits
 
 - Speech longer than 30 s is windowed with a fixed stride, while `whisper.cpp`
   advances the window by timestamps. Text agrees inside a window and diverges at
   the seam.
-- The decoder, not the encoder, is now the bottleneck: torch fp32 costs 2.4 s on
-  a 22.6 s clip against 338 ms for whisper.cpp's quantised decoder — 42% of
-  end-to-end. Threads do not help (the decode is latency-bound, 103 sequential
-  steps); the wall is flat at 4/8/16.
-- The process holds ~12.7 GB resident (weights plus the torch decoder).
+- With the torch decoder, the decoder and not the encoder is the bottleneck:
+  torch fp32 costs 2.4 s on a 22.6 s clip against 338 ms for whisper.cpp's
+  quantised decoder — 42% of end-to-end. Threads do not help (the decode is
+  latency-bound, 103 sequential steps); the wall is flat at 4/8/16. With
+  `NPU_STT_DECODER=ct2` the encoder is the bottleneck again (see above).
+- The process holds ~12.7 GB resident (weights plus the torch decoder); measured
+  on an 8700G with `large-v3-turbo`, the container sits at 8.3 GiB with torch
+  and 8.0 GiB with ct2.
 
 ## Units
 

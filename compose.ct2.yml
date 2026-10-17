@@ -1,0 +1,67 @@
+# Overlay on compose.yml for the CTranslate2 decoder (serve/ct2_decoder.py).
+#
+#   docker compose -f compose.yml -f compose.ct2.yml up -d --build stt
+#
+# or, once, in .env:  COMPOSE_FILE=compose.yml:compose.ct2.yml
+# and plain `docker compose ...` uses both files.
+#
+# stt is built from the repository's Dockerfile with the reference venv and
+# the CTranslate2 decoder (WITH_REFERENCE=1 WITH_CT2=1, versions from
+# requirements/*.lock.txt) and decodes with ct2 unless NPU_STT_DECODER says
+# otherwise. Everything else -- device, volumes, ports, the other knobs -- is
+# compose.yml's. VCS_REF (tests/run_all.sh sets it to the commit) is recorded
+# as the image's org.opencontainers.image.revision.
+#
+# The test-* services only start when asked for (profile "test"); run them
+# through tests/run_all.sh, which also takes stt down for the NPU tests:
+#
+#   docker compose --profile test run --rm test-cpu
+#   docker compose stop stt && docker compose --profile test run --rm test-npu
+
+services:
+  stt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_REFERENCE: "1"
+        WITH_CT2: "1"
+        VCS_REF: "${VCS_REF:-unknown}"
+    image: npu-whisper:ct2
+    environment:
+      NPU_STT_DECODER: "${NPU_STT_DECODER:-ct2}"
+
+  # CPU only, no device: serve/ct2_decoder.py on whisper-tiny, then the
+  # large-v3-turbo equivalence run against whisper.decode.
+  test-cpu:
+    image: npu-whisper:ct2
+    profiles: ["test"]
+    volumes:
+      - models:/root/.cache/whisper
+    command: >-
+      bash -c "refenv/bin/python -W ignore tests/test_ct2_unit.py &&
+               refenv/bin/python -W ignore tests/test_ct2_decoder.py"
+
+  # The repository's NPU acceptance gate. Needs the device to itself: the NPU
+  # allows 6 hw_contexts and stt holds most of them, and test 5 checks the
+  # ceiling, so stop stt first. Runs the image's checkout (the code stt runs).
+  test-npu:
+    image: npu-whisper:ct2
+    profiles: ["test"]
+    devices:
+      - /dev/accel/accel0
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:-992}"
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+    volumes:
+      - aot:/opt/npu-whisper/aot
+      - models:/root/.cache/whisper
+    command: >-
+      bash -c "refenv/bin/python -W ignore tools/dump_ref.py tests/data/jfk.wav &&
+               python3 -W ignore tests/test_rowops.py &&
+               python3 -W ignore tests/test_chain_acc.py &&
+               python3 -W ignore tests/test_encoder_golden.py"
