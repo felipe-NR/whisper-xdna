@@ -234,9 +234,13 @@ Outras observações:
    para 1,8–4,6 s, sem ganho de CPU. Faz sentido como experimento, ou para
    transcrição em background quando a GPU estiver ocupada (jogos, LLM local).
 3. Os caminhos para melhorar a NPU seriam: um `audio_ctx` dinâmico no cliente
-   (já ajuda nas frases curtas); o decoder em int8 ou no whisper.cpp
-   (`bench/probe_int8_decode.py`, ver HISTORY.md); e evitar a troca de
-   contexto fixando um ctx único para o ditado.
+   (já ajuda nas frases curtas); um decoder mais barato na CPU; e evitar a
+   troca de contexto fixando um ctx único para o ditado. A análise do decoder
+   está em [decoder.md](decoder.md): **CTranslate2 int8 com 8 threads corta o
+   decoder em 4,4–4,7×** (726 → 165 ms e 1564 → 335 ms) com texto idêntico, o
+   que deixaria o caminho NPU empatado com a iGPU em frases curtas. A
+   revalidação dos impedimentos citados pelo upstream está em
+   [upstream-validation.md](upstream-validation.md).
 4. O microfone tem um zumbido de 60 Hz (provável laço de terra ou cabo sem
    blindagem) que precisa ser corrigido no hardware, ou com um filtro
    passa-alta/notch no PipeWire, antes de ajustar VAD e sensibilidade.
