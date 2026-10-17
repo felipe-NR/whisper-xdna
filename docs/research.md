@@ -83,8 +83,12 @@ Observações do guia do 8700G que podem ser úteis aqui:
   - `large-v3-turbo` com um clipe de 11 s em ctx=1500: 3346 ms.
 - Serviço HTTP (`serve/`): `POST /inference` no formato do whisper.cpp
   (`file`, `language`, `audio_ctx`, `response_format`), porta 8090. O idioma é
-  **fixo por requisição** (padrão `NPU_STT_LANG=ru`), sem auto-detecção. Não
-  existe `/v1/audio/transcriptions`.
+  **fixo por requisição** (padrão `NPU_STT_LANG=ru`), sem auto-detecção.
+  **Correção (2026-10-17):** na primeira versão deste documento escrevi que não
+  existia `/v1/audio/transcriptions`. Existe: `do_POST` atende `/inference` e
+  `/v1/audio/transcriptions` com o mesmo handler, que devolve `{"text": ...}`.
+  Isso permite apontar o `whisper.mode = "remote"` do voxtype direto para o
+  serviço, sem shim (ainda não testado com o voxtype).
 - Maturidade: 3 commits, sem releases, precisão checada em 3 clipes (en/ru).
   Português não testado.
 - Requisitos: Docker, ~12 GB de imagem (`WITH_REFERENCE=1` para o serviço),
@@ -234,9 +238,13 @@ Outras observações:
    para 1,8–4,6 s, sem ganho de CPU. Faz sentido como experimento, ou para
    transcrição em background quando a GPU estiver ocupada (jogos, LLM local).
 3. Os caminhos para melhorar a NPU seriam: um `audio_ctx` dinâmico no cliente
-   (já ajuda nas frases curtas); o decoder em int8 ou no whisper.cpp
-   (`bench/probe_int8_decode.py`, ver HISTORY.md); e evitar a troca de
-   contexto fixando um ctx único para o ditado.
+   (já ajuda nas frases curtas); um decoder mais barato na CPU; e evitar a
+   troca de contexto fixando um ctx único para o ditado. A análise do decoder
+   está em [decoder.md](decoder.md): **CTranslate2 int8 com 8 threads corta o
+   decoder em 4,4–4,7×** (726 → 165 ms e 1564 → 335 ms) com texto idêntico, o
+   que deixaria o caminho NPU empatado com a iGPU em frases curtas. A
+   revalidação dos impedimentos citados pelo upstream está em
+   [upstream-validation.md](upstream-validation.md).
 4. O microfone tem um zumbido de 60 Hz (provável laço de terra ou cabo sem
    blindagem) que precisa ser corrigido no hardware, ou com um filtro
    passa-alta/notch no PipeWire, antes de ajustar VAD e sensibilidade.
@@ -247,9 +255,10 @@ Outras observações:
 - [x] Ativar o Docker e dar acesso ao usuário.
 - [x] Subir o `stt` com `NPU_STT_LANG=pt` (imagem publicada, só em localhost).
 - [x] Medir latência, qualidade e CPU nos dois caminhos.
-- [ ] Integrar com o voxtype: um shim `/v1/audio/transcriptions` →
-      `/inference` para usar `whisper.mode = "remote"`. A prioridade é baixa,
-      dados os resultados.
+- [ ] Integrar com o voxtype: `whisper.mode = "remote"` apontando para o
+      `/v1/audio/transcriptions` que o serviço já expõe (não precisa de shim;
+      falta testar se o voxtype envia `language` e o contrato multipart que o
+      serviço espera).
 - [ ] Medir energia (RAPL com root) no ditado: GPU × NPU.
 - [ ] Repetir com o microfone sem o zumbido de 60 Hz e com mais frases.
 - [x] Fork no GitHub: <https://github.com/felipe-NR/whisper-xdna> (`origin`),
