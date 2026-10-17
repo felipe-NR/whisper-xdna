@@ -13,7 +13,8 @@ times only the decoder, so every variant answers one question:
 
 Each runs on every --threads value. Reported per clip: tokens generated, the
 first step (prompt + cross-attention K/V over the whole context), the median
-per-token step, the total, and whether the text matches the baseline.
+per-token step, the total, the CPU time it burned across all threads
+(process_time), and whether the text matches the baseline.
 
   docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
     -v $PWD/bench:/b -v /path/to/audio:/a --entrypoint /opt/refenv/bin/python \
@@ -102,26 +103,33 @@ def main():
     opts = whisper.DecodingOptions(fp16=False, language=a.language,
                                    without_timestamps=True, temperature=0.0)
 
-    print("| clip | variant | threads | tokens | 1st step ms | ms/token | total ms | text = baseline |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| clip | variant | threads | tokens | 1st step ms | ms/token | total ms | CPU s | text = baseline |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for w, f in feats.items():
         ref_text = whisper.decode(model, f, opts)[0].text   # warm-up + reference
         for th in (int(x) for x in a.threads.split(",")):
             torch.set_num_threads(th)
             # decode/fp32: total only; DecodingTask exposes no per-step timing
-            tot = []
+            tot, cpu = [], []
             for _ in range(a.runs + 1):
-                t0 = time.perf_counter()
+                t0, c0 = time.perf_counter(), time.process_time()
                 text = whisper.decode(model, f, opts)[0].text
                 tot.append((time.perf_counter() - t0) * 1e3)
+                cpu.append(time.process_time() - c0)
             n = len(tok.encode(" " + text.strip()))
             print(f"| {w.rsplit('/', 1)[-1]} | decode/fp32 | {th} | ~{n} | – | – | "
-                  f"{statistics.median(tot[1:]):.0f} | {text == ref_text} |")
+                  f"{statistics.median(tot[1:]):.0f} | {statistics.median(cpu[1:]):.2f} | "
+                  f"{text == ref_text} |")
             for name, m, dt in (("greedy/fp32", model, torch.float32),
                                 ("greedy/bf16", bf16, torch.bfloat16),
                                 ("greedy/int8", int8, torch.float32)):
                 x = f.to(dt)
-                res = [greedy(m, tok, x) for _ in range(a.runs + 1)][1:]
+                res, cpu = [], []
+                for _ in range(a.runs + 1):
+                    c0 = time.process_time()
+                    res.append(greedy(m, tok, x))
+                    cpu.append(time.process_time() - c0)
+                res, cpu = res[1:], cpu[1:]
                 out = res[-1][0]
                 text = tok.decode(out)
                 firsts = [r[1] for r in res]
@@ -131,9 +139,10 @@ def main():
                       f"{statistics.median(firsts):.0f} | "
                       f"{statistics.median(steps):.1f} | "
                       f"{statistics.median(totals):.0f} | "
+                      f"{statistics.median(cpu):.2f} | "
                       f"{text.strip() == ref_text.strip()} |", flush=True)
                 if text.strip() != ref_text.strip():
-                    print(f"|  |  |  |  |  |  |  | `{text.strip()[:120]}` |")
+                    print(f"|  |  |  |  |  |  |  |  | `{text.strip()[:120]}` |")
 
 
 if __name__ == "__main__":

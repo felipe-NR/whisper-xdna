@@ -83,8 +83,12 @@ Observações do guia do 8700G que podem ser úteis aqui:
   - `large-v3-turbo` com um clipe de 11 s em ctx=1500: 3346 ms.
 - Serviço HTTP (`serve/`): `POST /inference` no formato do whisper.cpp
   (`file`, `language`, `audio_ctx`, `response_format`), porta 8090. O idioma é
-  **fixo por requisição** (padrão `NPU_STT_LANG=ru`), sem auto-detecção. Não
-  existe `/v1/audio/transcriptions`.
+  **fixo por requisição** (padrão `NPU_STT_LANG=ru`), sem auto-detecção.
+  **Correção (2026-10-17):** na primeira versão deste documento escrevi que não
+  existia `/v1/audio/transcriptions`. Existe: `do_POST` atende `/inference` e
+  `/v1/audio/transcriptions` com o mesmo handler, que devolve `{"text": ...}`.
+  Isso permite apontar o `whisper.mode = "remote"` do voxtype direto para o
+  serviço, sem shim (ainda não testado com o voxtype).
 - Maturidade: 3 commits, sem releases, precisão checada em 3 clipes (en/ru).
   Português não testado.
 - Requisitos: Docker, ~12 GB de imagem (`WITH_REFERENCE=1` para o serviço),
@@ -251,9 +255,10 @@ Outras observações:
 - [x] Ativar o Docker e dar acesso ao usuário.
 - [x] Subir o `stt` com `NPU_STT_LANG=pt` (imagem publicada, só em localhost).
 - [x] Medir latência, qualidade e CPU nos dois caminhos.
-- [ ] Integrar com o voxtype: um shim `/v1/audio/transcriptions` →
-      `/inference` para usar `whisper.mode = "remote"`. A prioridade é baixa,
-      dados os resultados.
+- [ ] Integrar com o voxtype: `whisper.mode = "remote"` apontando para o
+      `/v1/audio/transcriptions` que o serviço já expõe (não precisa de shim;
+      falta testar se o voxtype envia `language` e o contrato multipart que o
+      serviço espera).
 - [ ] Medir energia (RAPL com root) no ditado: GPU × NPU.
 - [ ] Repetir com o microfone sem o zumbido de 60 Hz e com mais frases.
 - [x] Fork no GitHub: <https://github.com/felipe-NR/whisper-xdna> (`origin`),

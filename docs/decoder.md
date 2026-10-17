@@ -75,9 +75,14 @@ upstream está em [upstream-validation.md](upstream-validation.md).
   - CTranslate2 int8: ~172 MB / 5,2 ms ≈ 33 GB/s.
 
   Cortar bytes por peso corta o tempo quase na mesma proporção.
-- **SMT atrapalha.** 8 threads (núcleos físicos) é 6–10% melhor que 16 em
-  todas as variantes. O padrão do serviço, `NPU_STT_TORCH_THREADS=16`, é
-  subótimo neste CPU.
+- **Threads: medir no serviço, não no probe.** No probe isolado, 8 threads
+  é 6–10% mais rápido que 16 em todas as variantes. **No serviço, o decoder
+  torch tem parede plana e gasta menos CPU com 16** (1,35 contra 4,07 CPU-s
+  com 8), como o upstream afirma. Para o CTranslate2, 8 threads iguala a parede
+  de 16 com 40% menos CPU. Detalhes em
+  [upstream-validation.md](upstream-validation.md#u9-threads). A primeira
+  versão deste documento recomendava `NPU_STT_TORCH_THREADS=8` com base no
+  probe: estava errado e foi retirado do plano.
 - **O int8 dinâmico do PyTorch perde para o bf16** porque a projeção de logits
   é o embedding amarrado (51866 × 1280 = 66 M pesos) e não é um `nn.Linear`;
   ela fica em fp32 e domina a leitura. O CTranslate2 quantiza também essa
@@ -139,8 +144,9 @@ docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
 
 ## Plano de refatoração (proposto, não implementado)
 
-1. **Fase 0, trivial:** `NPU_STT_TORCH_THREADS=8`. Ganho de ~10% no decoder,
-   sem tocar em código.
+1. ~~**Fase 0, trivial:** `NPU_STT_TORCH_THREADS=8`.~~ Retirada: o ganho só
+   aparece no probe isolado. No serviço, 16 threads tem a mesma parede e gasta
+   menos CPU ([U9](upstream-validation.md#u9-threads)).
 2. **Fase 1, decoder em CTranslate2 int8** em `serve/npu_stt_server.py`:
    - Uma variável `NPU_STT_DECODER=torch|ct2`, com `torch` como padrão para
      manter o comportamento do upstream.
