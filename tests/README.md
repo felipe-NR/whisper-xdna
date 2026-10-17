@@ -13,7 +13,7 @@ CLIPS=~/audio tests/run_all.sh serve          # + your own .wav/.txt pairs
 | stage | test | runs in | needs | what it guards |
 |---|---|---|---|---|
 | host | `test_compare_dictation.py` | host, stdlib | nothing | `tools/compare_dictation.py`: WER, normalisation, `audio_ctx` sizing, voxtype log parsing (text from stdout, never the truncated log line) |
-| build | — | `docker compose build stt` | the base image | the ct2 overlay image builds (`serve/ct2.Dockerfile`) |
+| build | — | `docker compose build stt` | network (apt, PyPI, GitHub) | `Dockerfile` with `WITH_REFERENCE=1 WITH_CT2=1` builds, refenv equals `requirements/*.lock.txt` (the build diffs `pip freeze` against them), `ctranslate2`/`whisper`/`numba` import; labelled with the commit (`-dirty` if the tree is not clean). `BUILD_FLAGS=--no-cache` builds from nothing |
 | cpu | `test_ct2_unit.py` | `test-cpu` (ct2 image) | CPU, whisper-tiny | `serve/ct2_decoder.py`: suppression set equal to `whisper.decode`'s own, vocabulary, conversion leaves the model untouched, cache key/hit/miss in a child, `max_length` semantics, float32 text identical to `whisper.decode`, the `NPU_STT_DECODER` knob |
 | cpu | `test_ct2_decoder.py` | `test-cpu` | CPU, large-v3-turbo | int8 text identical to `whisper.decode` on `jfk.wav` at ctx 1500 and 512 (pass more clips and `--ctx` by hand) |
 | npu | `test_rowops.py` | `test-npu` (ironenv) | the NPU, `stt` stopped | row-wise softmax/layernorm kernels |
@@ -28,22 +28,23 @@ service holds most of them. For the same reason the npu stage stops `stt`.
 
 ## Results on the reference host
 
-Ryzen 7 8700G (XDNA1, firmware 1.5.5.391), kernel 7.2.5, image
-`npu-whisper:ct2` on `kostryukov/npu-whisper:1.3.4`, 2026-10-17:
+Ryzen 7 8700G (XDNA1, firmware 1.5.5.391), kernel 7.2.5, 2026-10-17,
+`BUILD_FLAGS=--no-cache CLIPS=… tests/run_all.sh` at commit `75b52ee` (image
+`npu-whisper:ct2` built from `Dockerfile`, XRT 2.25.0):
 
-| stage | result |
-|---|---|
-| host | 17/17 |
-| cpu | 19/19 (`test_ct2_unit.py`), OK (`test_ct2_decoder.py`) |
-| npu | rowops PASS, chain_acc PASS, encoder golden 14/14 (bit-identical) |
-| serve-torch | 15/15 (with the two pt-BR clips of `docs/research.md`) |
-| serve-ct2 | 20/20, all 5 transcripts identical to the torch run |
+| stage | result | time |
+|---|---|---|
+| host | 17/17 | 0 s |
+| build | refenv matches the locks; `iron + pyxrt ok`; `ctranslate2 4.8.2` | 202 s (`--no-cache`) |
+| cpu | 19/19 (`test_ct2_unit.py`), OK (`test_ct2_decoder.py`) | 24 s |
+| npu | rowops PASS, chain_acc PASS, encoder golden 14/14 (bit-identical) | 18 s |
+| serve-torch | 15/15 (with the two pt-BR clips of `docs/research.md`) | 49 s |
+| serve-ct2 | 20/20, all 5 transcripts identical to the torch run | 56 s |
 
-The same stages (`cpu npu serve`) also pass, with the same counts, on the image
-built from the main `Dockerfile` (`WITH_REFERENCE=1 WITH_CT2=1`, commit
-`ea33950`, 2026-10-17), which carries XRT 2.25.0 and a newer `ironenv`. The
-encoder golden is still bit-identical there. See "Pinned versions" in the
-top-level README.
+Earlier, before the overlay image was dropped, the same counts were reached on
+`kostryukov/npu-whisper:1.3.4` + CTranslate2 (XRT 2.21.75), and on a cached
+build of `Dockerfile` at `ea33950`. See "Pinned versions" in the top-level
+README for what differs between those images.
 
 ## Two things the tests caught
 

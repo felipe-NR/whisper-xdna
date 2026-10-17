@@ -116,20 +116,24 @@ tokens; a integração precisa revalidar a transcrição de ponta a ponta.
 | [`bench/probe_decoder_ct2.py`](../bench/probe_decoder_ct2.py) | CTranslate2 `generate()` sobre o mesmo encoder output, por `compute_type` |
 | [`tools/compare_dictation.py`](../tools/compare_dictation.py) | Ponta a ponta: voxtype/Vulkan contra o serviço da NPU |
 
+As medições acima foram feitas na imagem `kostryukov/npu-whisper:1.3.4`, com o
+CTranslate2 instalado à parte. Para reproduzir hoje, use a imagem do serviço
+(`npu-whisper:ct2`, construída pelo `compose.ct2.yml`), que já traz o
+CTranslate2 e o mesmo `refenv`, travado pelo lock:
+
 ```bash
-# PyTorch: imagem do serviço, container descartável
+# PyTorch
 docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
   -v $PWD/bench:/b:ro -v ~/Projects/npu-bench-audio:/a:ro \
-  --entrypoint /opt/refenv/bin/python kostryukov/npu-whisper:1.3.4 \
+  --entrypoint /opt/refenv/bin/python npu-whisper:ct2 \
   -W ignore /b/probe_decoder_cpu.py --threads 16,8 /a/pt-curto.wav /a/pt-longo.wav
 
-# CTranslate2: --no-deps, senão o pip troca o numpy da imagem e quebra o numba
+# CTranslate2 (modelo convertido em /ct2)
 docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
   -v $PWD/bench:/b:ro -v ~/Projects/bench-tools/ct2-turbo:/ct2:ro \
-  -v ~/Projects/npu-bench-audio:/a:ro --entrypoint bash kostryukov/npu-whisper:1.3.4 -c '
-  /opt/refenv/bin/python -m pip install -q --no-deps --target /tmp/ct2 ctranslate2==4.8.2 &&
-  PYTHONPATH=/tmp/ct2 /opt/refenv/bin/python -W ignore /b/probe_decoder_ct2.py \
-    --ct2 /ct2 --compute-types float32,int8 --threads 8 /a/pt-curto.wav /a/pt-longo.wav'
+  -v ~/Projects/npu-bench-audio:/a:ro --entrypoint /opt/refenv/bin/python npu-whisper:ct2 \
+  -W ignore /b/probe_decoder_ct2.py --ct2 /ct2 --compute-types float32,int8 \
+  --threads 8 /a/pt-curto.wav /a/pt-longo.wav
 ```
 
 - Modelo CTranslate2 usado: `deepdml/faster-whisper-large-v3-turbo-ct2`
@@ -163,10 +167,16 @@ docker run --rm -v whisper-xdna_models:/root/.cache/whisper \
 |---|---|
 | `serve/ct2_decoder.py` | Conversor próprio (checkpoint openai → `WhisperSpec` do CTranslate2), cache por SHA-256 e `CT2Decoder.decode()` |
 | `serve/npu_stt_server.py` | `NPU_STT_DECODER=torch\|ct2` (padrão `torch`), `NPU_STT_CT2_COMPUTE`, `NPU_STT_CT2_THREADS`, `NPU_STT_CT2_DIR`; o `_window` decodifica com o ct2 quando ativo; o `/health` informa o decoder |
-| `serve/ct2.Dockerfile` | Imagem sobreposta à publicada, com `ctranslate2==4.8.2` e `pyyaml==6.0.2` no `refenv` via `--no-deps` |
-| `compose.yml` | As novas variáveis e o volume `ct2` para o cache |
-| `tests/test_ct2_decoder.py` | Equivalência na CPU contra o `whisper.decode` |
+| `Dockerfile` | `WITH_CT2=1`: `ctranslate2==4.8.2` e `PyYAML==6.0.2` no `refenv` via `--no-deps`; o `refenv` inteiro travado por `requirements/refenv.lock.txt`, com diff do `pip freeze` no build |
+| `requirements/` | `refenv.lock.txt` (o `refenv` exato da imagem validada) e `refenv-ct2.lock.txt` |
+| `compose.yml`, `compose.ct2.yml` | As novas variáveis e o volume `ct2` para o cache; o `compose.ct2.yml` constrói o `stt` com `WITH_REFERENCE=1 WITH_CT2=1` e define os serviços de teste |
+| `tests/` | `test_ct2_decoder.py`, `test_ct2_unit.py`, `test_serve_http.py`, `test_compare_dictation.py` e `run_all.sh` ([tests/README.md](../tests/README.md)) |
 | `.dockerignore` | `.env` local fora das imagens |
+
+A primeira versão usava um Dockerfile sobreposto (`serve/ct2.Dockerfile`), que
+instalava o CTranslate2 por cima da imagem publicada `kostryukov/npu-whisper`.
+Ele foi removido quando o `WITH_CT2=1` do `Dockerfile` principal passou na
+suíte completa: duplicava a instalação e dependia de uma imagem de terceiros.
 
 ### Onde a implementação divergiu do plano, e por quê
 

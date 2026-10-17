@@ -165,15 +165,17 @@ checks that on CPU against `whisper.decode` for 3 clips × 3 contexts, including
 two where both decoders loop, and stop on the same token.
 
 ```bash
-# compose.ct2.yml builds the overlay image and sets NPU_STT_DECODER=ct2
-RENDER_GID=$(getent group render | cut -d: -f3) \
+# compose.ct2.yml builds stt from Dockerfile with WITH_REFERENCE=1 WITH_CT2=1
+# and sets NPU_STT_DECODER=ct2
+RENDER_GID=$(getent group render | cut -d: -f3) VCS_REF=$(git rev-parse HEAD) \
   docker compose -f compose.yml -f compose.ct2.yml up -d --build stt
 ```
 
 To make that the default for every `docker compose` call in the checkout, put
-`COMPOSE_FILE=compose.yml:compose.ct2.yml` in `.env`. `NPU_WHISPER_BASE` picks
-the image the overlay extends (default `kostryukov/npu-whisper:1.3.4`; any
-image built from `Dockerfile` with `WITH_REFERENCE=1` works). Tests:
+`COMPOSE_FILE=compose.yml:compose.ct2.yml` in `.env`. The build is the full
+`Dockerfile` (measured: 202 s from nothing with `--no-cache` on a Ryzen 7
+8700G, base images already pulled). `VCS_REF` becomes the image's
+`org.opencontainers.image.revision`. Tests:
 [`tests/README.md`](../tests/README.md).
 
 How it works:
@@ -202,9 +204,11 @@ How it works:
 | `NPU_STT_CT2_THREADS` | `8` | Measured in the service: 8 matches 16 on wall clock (142 vs 143 ms) at 40% less CPU (1.21 vs 2.00 s/request); 4 saves another 17% CPU for +43 ms |
 | `NPU_STT_CT2_DIR` | `~/.cache/npu-whisper/ct2` | the `ct2` volume in `compose.yml` |
 
-The image is an overlay on the published one (`serve/ct2.Dockerfile`):
-`ctranslate2` and `pyyaml` go into refenv with `--no-deps`, because letting pip
-resolve numpy replaces refenv's with one numba refuses to import.
+In the image, `WITH_CT2=1` puts `ctranslate2` and `PyYAML` into refenv from
+`requirements/refenv-ct2.lock.txt` with `--no-deps`, because letting pip
+resolve numpy replaces refenv's with one numba refuses to import. The build
+then checks that refenv is exactly the lock files (see "Pinned versions" in
+the top-level README).
 
 ## Known limits
 
