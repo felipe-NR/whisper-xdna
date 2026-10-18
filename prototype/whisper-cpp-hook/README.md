@@ -114,5 +114,13 @@ encoder on a runtime wiped of the previous source's weight BOs.
   loads its weights from the openai checkpoint. That is identical to the ggml
   f16 file (see above). The service itself still reads the checkpoint.
 - **Encoder runtime.** The callback here copies a file. The real one drives
-  the NPU through XRT. That runtime is the Python code in `src/`, and it has
-  to be ported to C++.
+  the NPU through XRT, and that runtime is the Python code in `src/` today. The
+  design agreed for voxtype splits it in two:
+  - a thin C shim over XRT (`libvoxtype_xrt.so`: about 15 functions over
+    opaque handles, plus one `vxrt_npu_run`), loaded with dlopen;
+  - the encoder graph in Rust inside voxtype: chaining, runlists, the ctx
+    ladder, the host ops, and weight BOs built from the ggml tensors.
+
+  A self-contained C++ encoder library behind the same callback is the
+  alternative. It would be reusable outside voxtype, but would move most of
+  the code out of what voxtype's maintainer reviews.
