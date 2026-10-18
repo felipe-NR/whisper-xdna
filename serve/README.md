@@ -372,6 +372,30 @@ case is the median of 4-8 requests (range in brackets), `large-v3-turbo`.
 In absolute terms, the best case saves ~16 J per short phrase (~0.004 Wh):
 0.44 Wh a day at 100 dictations, at the cost of 0.16 s more latency.
 
+**With weights resident across ladder steps** (9a1ba08), same method, NPU and
+iGPU only, 2026-10-18:
+
+| phrase (ctx step) | NPU | iGPU |
+|---|---|---|
+| 6 s pt (512), warm or after a switch | **33.5 J** (31.0-35.2), 1.45 s (1.54 s after a switch) | 45.5 J (44.1-47.5), 1.29 s |
+| 11 s en (768) | **44.0 J** (42.2-46.1), 2.40 s | 46.1 J (45.2-48.6), 1.29 s |
+| 20 s pt (1280) | 68.6 J (68.1-69.7), 3.70 s | 54.6 J (52.7-60.1), 1.54 s |
+| the 8 phrases | 354 J, 364 J | 381 J, 393 J |
+
+- A switch no longer costs energy (33.6 J against 33.5 J warm). The NPU now
+  uses 26% less on short phrases, ties at 11 s and costs 26% more at 20 s.
+  Over the sequence it is 7% below the iGPU.
+- The slot figures carry about ±3 J of baseline uncertainty. Idle came out
+  0.2 W lower than in the run above, and over a 15 s slot that moves the
+  marginal energy by ~3 J. That is why the 6 s warm figure reads 33.5 J here
+  against 29.8 J there. The energy during the request itself is stable: 22.0 J
+  against 21.8 J.
+- The autosuspend tail (~11 J) is now the largest single cost. Without it, the
+  NPU's energy during the request is 22.0 J against 45.6 J at 6 s, 32.8 J
+  against 45.7 J at 11 s, and 57.3 J against 54.5 J at 20 s.
+- Idle: 4.41 W with the service stopped, 4.47 W with it resident, 4.57 W with
+  a resident Vulkan daemon on top. The differences are within noise.
+
 ## Known limits
 
 - Every encoder pass uses **9 designs** (xclbins), but NPU1 holds only 6
