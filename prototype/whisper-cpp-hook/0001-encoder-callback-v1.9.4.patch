@@ -1,0 +1,301 @@
+From b998ba09e46a9e7553d540b35de18f6d0396d4d7 Mon Sep 17 00:00:00 2001
+From: Felipe Neves Ricardo <felipe.nevesricardo@gmail.com>
+Date: Sun, 18 Oct 2026 03:26:26 -0300
+Subject: [PATCH] whisper : runtime encoder-output callback (prototype) +
+ npu-feed test
+
+---
+ examples/CMakeLists.txt          |   1 +
+ examples/npu-feed/CMakeLists.txt |   3 +
+ examples/npu-feed/npu-feed.cpp   | 146 +++++++++++++++++++++++++++++++
+ include/whisper.h                |  23 +++++
+ src/whisper.cpp                  |  43 ++++++++-
+ 5 files changed, 215 insertions(+), 1 deletion(-)
+ create mode 100644 examples/npu-feed/CMakeLists.txt
+ create mode 100644 examples/npu-feed/npu-feed.cpp
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 7aedb9d..80a43fd 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -109,6 +109,7 @@ else()
+     add_subdirectory(vad-speech-segments)
+     add_subdirectory(parakeet-cli)
+     add_subdirectory(parakeet-quantize)
++    add_subdirectory(npu-feed)
+     if (WHISPER_SDL2)
+         add_subdirectory(stream)
+         add_subdirectory(command)
+diff --git a/examples/npu-feed/CMakeLists.txt b/examples/npu-feed/CMakeLists.txt
+new file mode 100644
+index 0000000..732499f
+--- /dev/null
++++ b/examples/npu-feed/CMakeLists.txt
+@@ -0,0 +1,3 @@
++set(TARGET whisper-npu-feed)
++add_executable(${TARGET} npu-feed.cpp)
++target_link_libraries(${TARGET} PRIVATE whisper ${CMAKE_THREAD_LIBS_INIT})
+diff --git a/examples/npu-feed/npu-feed.cpp b/examples/npu-feed/npu-feed.cpp
+new file mode 100644
+index 0000000..2fe62c3
+--- /dev/null
++++ b/examples/npu-feed/npu-feed.cpp
+@@ -0,0 +1,146 @@
++// Prototype for whisper_set_encoder_callback(): decode with whisper.cpp's own
++// decoder from encoder output computed elsewhere (the XDNA1 NPU), saved as .npy.
++//
++//   npu-feed MODEL WAV FEATS.npy|ggml LANG AUDIO_CTX [THREADS] [RUNS] [MEL_OUT.npy]
++//
++// FEATS.npy is float32 (n_ctx, n_state), the encoder output after ln_post.
++// "ggml" runs whisper.cpp's own encoder instead, for comparison. MEL_OUT, if
++// given, receives the log-mel whisper.cpp computed (n_mel, 2*n_ctx) -- what a
++// native integration would hand the NPU instead of torch's mel.
++
++#include "whisper.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++struct npy { std::vector<float> data; int rows = 0, cols = 0; };
++
++static bool read_npy(const char * path, npy & out) {
++    std::ifstream f(path, std::ios::binary);
++    if (!f) return false;
++    char magic[6]; f.read(magic, 6);
++    if (memcmp(magic, "\x93NUMPY", 6) != 0) return false;
++    uint8_t ver[2]; f.read((char *) ver, 2);
++    uint32_t hlen = 0;
++    if (ver[0] == 1) { uint16_t h; f.read((char *) &h, 2); hlen = h; }
++    else             { f.read((char *) &hlen, 4); }
++    std::string hdr(hlen, ' '); f.read(&hdr[0], hlen);
++    if (hdr.find("'<f4'") == std::string::npos || hdr.find("'fortran_order': False") == std::string::npos) {
++        fprintf(stderr, "%s: need C-order float32\n", path); return false;
++    }
++    auto p = hdr.find("'shape': (");
++    if (sscanf(hdr.c_str() + p, "'shape': (%d, %d)", &out.rows, &out.cols) != 2) return false;
++    out.data.resize((size_t) out.rows * out.cols);
++    f.read((char *) out.data.data(), out.data.size() * sizeof(float));
++    return (bool) f;
++}
++
++static void write_npy(const char * path, const float * d, int rows, int cols) {
++    char hdr[128];
++    int n = snprintf(hdr, sizeof hdr, "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", rows, cols);
++    int pad = 64 - (10 + n + 1) % 64; if (pad == 64) pad = 0;
++    std::string h(hdr, n); h.append(pad, ' '); h.push_back('\n');
++    FILE * f = fopen(path, "wb");
++    uint16_t hl = (uint16_t) h.size();
++    fwrite("\x93NUMPY\x01\x00", 1, 8, f); fwrite(&hl, 2, 1, f); fwrite(h.data(), 1, h.size(), f);
++    fwrite(d, sizeof(float), (size_t) rows * cols, f); fclose(f);
++}
++
++static bool read_wav(const char * path, std::vector<float> & pcm) {
++    std::ifstream f(path, std::ios::binary);
++    std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
++    if (b.size() < 44 || memcmp(b.data(), "RIFF", 4) || memcmp(b.data() + 8, "WAVE", 4)) return false;
++    size_t off = 12;
++    while (off + 8 <= b.size()) {
++        uint32_t sz; memcpy(&sz, b.data() + off + 4, 4);
++        if (!memcmp(b.data() + off, "data", 4)) {
++            const int16_t * s = (const int16_t *) (b.data() + off + 8);
++            pcm.resize(sz / 2);
++            for (size_t i = 0; i < pcm.size(); i++) pcm[i] = s[i] / 32768.0f;
++            return true;
++        }
++        off += 8 + sz + (sz & 1);
++    }
++    return false;
++}
++
++struct feed { npy feats; const char * mel_out = nullptr; int calls = 0; };
++
++static bool encoder_cb(const float * mel, int n_mel, int n_ctx, float * out, int n_state, void * ud) {
++    auto * fd = (feed *) ud;
++    fd->calls++;
++    if (fd->mel_out && fd->calls == 1) write_npy(fd->mel_out, mel, n_mel, 2 * n_ctx);
++    if (fd->feats.rows != n_ctx || fd->feats.cols != n_state) {
++        fprintf(stderr, "encoder_cb: whisper wants (%d, %d), file has (%d, %d)\n",
++                n_ctx, n_state, fd->feats.rows, fd->feats.cols);
++        return false;
++    }
++    memcpy(out, fd->feats.data.data(), fd->feats.data.size() * sizeof(float));
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 6) {
++        fprintf(stderr, "usage: %s MODEL WAV FEATS.npy|ggml LANG AUDIO_CTX [THREADS] [RUNS] [MEL_OUT.npy]\n", argv[0]);
++        return 2;
++    }
++    const char * model = argv[1], * wav = argv[2], * feats = argv[3], * lang = argv[4];
++    const int audio_ctx = atoi(argv[5]);
++    const int threads   = argc > 6 ? atoi(argv[6]) : 8;
++    const int runs      = argc > 7 ? atoi(argv[7]) : 3;
++
++    std::vector<float> pcm;
++    if (!read_wav(wav, pcm)) { fprintf(stderr, "cannot read %s\n", wav); return 1; }
++
++    whisper_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
++    auto cp = whisper_context_default_params();
++    cp.use_gpu = false;
++    whisper_context * ctx = whisper_init_from_file_with_params(model, cp);
++    if (!ctx) return 1;
++
++    feed fd;
++    fd.mel_out = argc > 8 ? argv[8] : nullptr;
++    const bool ext = strcmp(feats, "ggml") != 0;
++    if (ext) {
++        if (!read_npy(feats, fd.feats)) { fprintf(stderr, "cannot read %s\n", feats); return 1; }
++        whisper_set_encoder_callback(ctx, encoder_cb, &fd);
++    }
++
++    auto wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
++    wp.language = lang;
++    wp.audio_ctx = audio_ctx;
++    wp.n_threads = threads;
++    wp.no_timestamps = true;
++    wp.single_segment = false;
++    wp.print_progress = wp.print_realtime = wp.print_timestamps = wp.print_special = false;
++    wp.temperature_inc = 0.0f;   // no fallback re-decodes: one pass, comparable timings
++
++    std::vector<double> wall, enc, dec;
++    std::string text;
++    for (int r = 0; r < runs + 1; r++) {   // run 0 is a warm-up
++        whisper_reset_timings(ctx);
++        auto t0 = std::chrono::steady_clock::now();
++        if (whisper_full(ctx, wp, pcm.data(), (int) pcm.size()) != 0) { fprintf(stderr, "whisper_full failed\n"); return 1; }
++        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        auto * t = whisper_get_timings(ctx);
++        if (r == 0) continue;
++        wall.push_back(ms);
++        enc.push_back(t->encode_ms);
++        dec.push_back(t->decode_ms + t->batchd_ms + t->prompt_ms);
++        text.clear();
++        for (int i = 0; i < whisper_full_n_segments(ctx); i++) text += whisper_full_get_segment_text(ctx, i);
++    }
++    auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
++    printf("{\"encoder\": \"%s\", \"audio_ctx\": %d, \"threads\": %d, \"runs\": %d, "
++           "\"wall_ms\": %.1f, \"encode_ms\": %.1f, \"decode_ms\": %.1f, \"cb_calls\": %d, \"text\": \"%s\"}\n",
++           ext ? "external" : "ggml", audio_ctx, threads, runs, med(wall), med(enc), med(dec), fd.calls, text.c_str());
++    whisper_free(ctx);
++    return 0;
++}
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..1e317f9 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -264,6 +264,29 @@ extern "C" {
+                     const char * device,
+                     const char * cache_dir);
+ 
++    // Encoder output computed outside whisper.cpp (e.g. on an NPU).
++    // Once set, the ggml conv and encoder graphs are skipped: for every window
++    // the callback receives the log-mel input -- n_mel rows of 2*n_ctx frames,
++    // row-major per mel bin -- and must write the encoder output after ln_post,
++    // n_ctx rows of n_state floats, into out. n_ctx follows audio_ctx in
++    // whisper_full_params (0 = the model's n_audio_ctx). Return false to abort
++    // the encode. The cross-attention K/V are still computed by whisper.cpp.
++    // Pass cb = NULL to go back to the ggml encoder.
++    typedef bool (*whisper_encoder_callback)(
++            const float * mel, int n_mel, int n_ctx,
++                  float * out, int n_state, void * user_data);
++
++    WHISPER_API void whisper_set_encoder_callback_with_state(
++        struct whisper_context * ctx,
++          struct whisper_state * state,
++       whisper_encoder_callback  cb,
++                          void * user_data);
++
++    WHISPER_API void whisper_set_encoder_callback(
++        struct whisper_context * ctx,
++       whisper_encoder_callback  cb,
++                          void * user_data);
++
+     // Frees all allocated memory
+     WHISPER_API void whisper_free      (struct whisper_context * ctx);
+     WHISPER_API void whisper_free_state(struct whisper_state * state);
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 66130cf..e1c1844 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -911,6 +911,11 @@ struct whisper_state {
+     whisper_vitisai_context * ctx_vitisai = nullptr;
+ #endif
+ 
++    // whisper_set_encoder_callback(): encoder output from outside whisper.cpp
++    whisper_encoder_callback encoder_cb = nullptr;
++    void * encoder_cb_data = nullptr;
++    std::vector<float> encoder_cb_out;
++
+     // [EXPERIMENTAL] token-level timestamps data
+     int64_t t_beg  = 0;
+     int64_t t_last = 0;
+@@ -1990,7 +1995,7 @@ static bool whisper_encode_external(const whisper_state & wstate) {
+     const bool use_vitisai = wstate.ctx_vitisai != nullptr;
+ #endif
+ 
+-    return use_coreml || use_openvino || use_vitisai;
++    return use_coreml || use_openvino || use_vitisai || wstate.encoder_cb != nullptr;
+ }
+ 
+ static bool whisper_cross_external(const whisper_state & wstate) {
+@@ -2440,6 +2445,21 @@ static bool whisper_encode_internal(
+             if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                 return false;
+             }
++        } else if (wstate.encoder_cb) {
++            const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++            const int n_state = wctx.model.hparams.n_audio_state;
++
++            auto & out = wstate.encoder_cb_out;
++            out.resize((size_t) n_ctx*n_state);
++            if (!wstate.encoder_cb(wstate.inp_mel.data(), wctx.model.hparams.n_mels, n_ctx,
++                                   out.data(), n_state, wstate.encoder_cb_data)) {
++                WHISPER_LOG_ERROR("%s: encoder callback failed\n", __func__);
++                return false;
++            }
++            GGML_ASSERT(ggml_nelements(wstate.embd_enc) == (int64_t) out.size());
++            ggml_backend_tensor_set(wstate.embd_enc, out.data(), 0, out.size()*sizeof(float));
++
++            ggml_backend_sched_reset(sched);
+         } else {
+             ggml_backend_sched_reset(sched);
+ 
+@@ -3676,6 +3696,27 @@ int whisper_ctx_init_openvino_encoder_with_state(
+ #endif
+ }
+ 
++void whisper_set_encoder_callback_with_state(
++        struct whisper_context * ctx,
++          struct whisper_state * state,
++       whisper_encoder_callback  cb,
++                          void * user_data) {
++    (void)(ctx);
++    state->encoder_cb      = cb;
++    state->encoder_cb_data = user_data;
++    if (!cb) {
++        state->encoder_cb_out.clear();
++        state->encoder_cb_out.shrink_to_fit();
++    }
++}
++
++void whisper_set_encoder_callback(
++        struct whisper_context * ctx,
++       whisper_encoder_callback  cb,
++                          void * user_data) {
++    whisper_set_encoder_callback_with_state(ctx, ctx->state, cb, user_data);
++}
++
+ int whisper_ctx_init_openvino_encoder(
+         struct whisper_context * ctx,
+                     const char * model_path,
+-- 
+2.55.0
+

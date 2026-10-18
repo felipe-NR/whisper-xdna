@@ -1,0 +1,105 @@
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -264,6 +264,29 @@
+                     const char * device,
+                     const char * cache_dir);
+ 
++    // Encoder output computed outside whisper.cpp (e.g. on an NPU).
++    // Once set, the ggml conv and encoder graphs are skipped: for every window
++    // the callback receives the log-mel input -- n_mel rows of 2*n_ctx frames,
++    // row-major per mel bin -- and must write the encoder output after ln_post,
++    // n_ctx rows of n_state floats, into out. n_ctx follows audio_ctx in
++    // whisper_full_params (0 = the model's n_audio_ctx). Return false to abort
++    // the encode. The cross-attention K/V are still computed by whisper.cpp.
++    // Pass cb = NULL to go back to the ggml encoder.
++    typedef bool (*whisper_encoder_callback)(
++            const float * mel, int n_mel, int n_ctx,
++                  float * out, int n_state, void * user_data);
++
++    WHISPER_API void whisper_set_encoder_callback_with_state(
++        struct whisper_context * ctx,
++          struct whisper_state * state,
++       whisper_encoder_callback  cb,
++                          void * user_data);
++
++    WHISPER_API void whisper_set_encoder_callback(
++        struct whisper_context * ctx,
++       whisper_encoder_callback  cb,
++                          void * user_data);
++
+     // Frees all allocated memory
+     WHISPER_API void whisper_free      (struct whisper_context * ctx);
+     WHISPER_API void whisper_free_state(struct whisper_state * state);
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -903,6 +903,11 @@
+     whisper_openvino_context * ctx_openvino = nullptr;
+ #endif
+ 
++    // whisper_set_encoder_callback(): encoder output from outside whisper.cpp
++    whisper_encoder_callback encoder_cb = nullptr;
++    void * encoder_cb_data = nullptr;
++    std::vector<float> encoder_cb_out;
++
+     // [EXPERIMENTAL] token-level timestamps data
+     int64_t t_beg  = 0;
+     int64_t t_last = 0;
+@@ -1970,7 +1975,7 @@
+     const bool use_openvino = wstate.ctx_openvino != nullptr;
+ #endif
+ 
+-    return use_coreml || use_openvino;
++    return use_coreml || use_openvino || wstate.encoder_cb != nullptr;
+ }
+ 
+ static struct ggml_cgraph * whisper_build_graph_conv(
+@@ -2406,6 +2411,21 @@
+             if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                 return false;
+             }
++        } else if (wstate.encoder_cb) {
++            const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++            const int n_state = wctx.model.hparams.n_audio_state;
++
++            auto & out = wstate.encoder_cb_out;
++            out.resize((size_t) n_ctx*n_state);
++            if (!wstate.encoder_cb(wstate.inp_mel.data(), wctx.model.hparams.n_mels, n_ctx,
++                                   out.data(), n_state, wstate.encoder_cb_data)) {
++                WHISPER_LOG_ERROR("%s: encoder callback failed\n", __func__);
++                return false;
++            }
++            GGML_ASSERT(ggml_nelements(wstate.embd_enc) == (int64_t) out.size());
++            ggml_backend_tensor_set(wstate.embd_enc, out.data(), 0, out.size()*sizeof(float));
++
++            ggml_backend_sched_reset(sched);
+         } else {
+             ggml_backend_sched_reset(sched);
+ 
+@@ -3595,6 +3615,27 @@
+ #endif
+ }
+ 
++void whisper_set_encoder_callback_with_state(
++        struct whisper_context * ctx,
++          struct whisper_state * state,
++       whisper_encoder_callback  cb,
++                          void * user_data) {
++    (void)(ctx);
++    state->encoder_cb      = cb;
++    state->encoder_cb_data = user_data;
++    if (!cb) {
++        state->encoder_cb_out.clear();
++        state->encoder_cb_out.shrink_to_fit();
++    }
++}
++
++void whisper_set_encoder_callback(
++        struct whisper_context * ctx,
++       whisper_encoder_callback  cb,
++                          void * user_data) {
++    whisper_set_encoder_callback_with_state(ctx, ctx->state, cb, user_data);
++}
++
+ int whisper_ctx_init_openvino_encoder(
+         struct whisper_context * ctx,
+                     const char * model_path,
