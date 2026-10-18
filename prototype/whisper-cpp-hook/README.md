@@ -105,6 +105,27 @@ encoder on a runtime wiped of the previous source's weight BOs.
 
 ## Caveats for a real integration
 
+- **Reduced `audio_ctx` hallucinates on edge cases.** This is whisper.cpp's
+  own behaviour, not the NPU's: Vulkan with `context_window_optimization`
+  (432 / 1232) produces the same errors. Reported by the voxtype session,
+  which ran the native NPU encoder at the ladder ctx:
+  - jfk cut to 6 s, mid-sentence, at 512 ends "…ask not what your country is.";
+  - jfk twice back to back (22 s) at 1280 repeats the sentence three times.
+
+  Full ctx (1500) gets both right. On real clips the ladder ctx and 1500 gave
+  identical text here (6 s @512, 11 s @768, 20 s @1280), so there is no
+  evidence yet that the selection margin is too small for real dictation. A
+  safety net would be to retry at full ctx when the output repeats a long
+  n-gram.
+- **No stale output in rawxrt.** The voxtype loader saw the first 64 bytes of
+  an output BO keep the previous launch's contents until it flushed that cache
+  line before each launch. rawxrt does not reproduce this. Every device path
+  was on, NPU GELU included: whisper-tiny @512 and large-v3-turbo @768 on jfk
+  gave bit-identical output in 6 fresh processes each, and pass 1 equalled
+  pass 2 in every process. The likely difference: rawxrt never writes into an
+  output BO from the host, so no dirty CPU line can be written back over the
+  NPU's result. Any output BO the host has written to (zero-fill, reuse as an
+  input) needs a `sync(TO_DEVICE)` before the launch.
 - **Language detection.** whisper.cpp runs the encoder a second time when it
   auto-detects the language (measured from voxtype: +1.08 s on the iGPU). With
   this hook, the callback would fire twice and run the NPU encoder twice. The
