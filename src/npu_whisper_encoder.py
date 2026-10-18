@@ -435,7 +435,15 @@ def im2col(x, kernel, stride, pad):
 
 def encoder(W, mel, mm, attn_mm, n_layer=4, n_head=6, prof=None,
             fused_gelu=False, npu_softmax=False, attn_fn=None,
-            mlp_fn=None, fold_bias=True):
+            mlp_fn=None, fold_bias=True, taps=None):
+    """taps: a dict to receive copies of the intermediate stages -- conv1 and
+    conv2 outputs after GELU, the input of blocks 0 and 1 (so block 0's output
+    too), and ln_post's input. Golden fixtures for reimplementing the host side
+    without an NPU; None (the default) records nothing."""
+    def tap(name, v):
+        if taps is not None:
+            taps[name] = np.array(v, dtype=np.float32, copy=True)
+
     def tic():
         return time.perf_counter()
 
@@ -446,12 +454,14 @@ def encoder(W, mel, mm, attn_mm, n_layer=4, n_head=6, prof=None,
     A = _timed("im2col", im2col, mel, KS, 1, 1)  # (3000, 240)
     x = mm(A, np.ascontiguousarray(c1w.reshape(O, C * KS).T)) + W["w.conv1.bias"]
     x = _timed("gelu", gelu, x)                  # (3000, 384)
+    tap("conv1_gelu", x)
 
     c2w = W["w.conv2.weight"]                    # (384, 384, 3)
     O2, C2, KS2 = c2w.shape
     A = _timed("im2col", im2col, np.ascontiguousarray(x.T), KS2, 2, 1)  # (1500, 1152)
     x = mm(A, np.ascontiguousarray(c2w.reshape(O2, C2 * KS2).T)) + W["w.conv2.bias"]
     x = _timed("gelu", gelu, x)                  # (1500, 384)
+    tap("conv2_gelu", x)
 
     # Sliced, not assumed equal: a shortened mel gives fewer than 1500
     # frames and the positional embedding has to be cut with it.
@@ -461,6 +471,8 @@ def encoder(W, mel, mm, attn_mm, n_layer=4, n_head=6, prof=None,
     scale = hd ** -0.25
 
     for L in range(n_layer):
+        if L < 2:
+            tap(f"block{L}_in", x)
         p = f"w.blocks.{L}."
         h = _timed("layernorm", layer_norm, x, W[p + "attn_ln.weight"],
                    W[p + "attn_ln.bias"])
@@ -535,6 +547,7 @@ def encoder(W, mel, mm, attn_mm, n_layer=4, n_head=6, prof=None,
                 mm(h, W[p + "mlp.0.weight_T"]) + W[p + "mlp.0.bias"]))
         x = x + mm(f, W[p + "mlp.2.weight_T"]) + W[p + "mlp.2.bias"]
 
+    tap("ln_post_in", x)
     x = layer_norm(x, W["w.ln_post.weight"], W["w.ln_post.bias"])
     if prof is not None:
         prof["total"] = tic() - t_all

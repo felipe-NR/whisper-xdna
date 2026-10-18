@@ -159,6 +159,46 @@ def np_softmax(x):
     return e / e.sum(axis=-1, keepdims=True)
 
 
+def chain_designs(nh, ctx, hd):
+    """The three designs of one attention geometry and the padding they share.
+
+    Pure apart from compiling a missing overlay, so the artifact exporter can
+    ask for exactly what RawRT._chain() will open -- one derivation for both.
+    """
+    # The two GEMMs of the chain want different tile shapes -- QK is skinny
+    # in K, AV is skinny in N -- and each shape implies its own row padding.
+    # Taking each from padded_shape() independently makes them disagree
+    # whenever ctx is not a multiple of 512 (QK rounds to 256, AV to 512), and
+    # the AV GEMM reads the QK output, so the chain then asserted and dropped
+    # to the host path in silence: at ctx=1152 that cost 10.0 s against 5.4 s
+    # at the LARGER ctx=1500. One row padding is derived for both stages.
+    TMq, TKq, TNq = tiles_for(ctx, hd, ctx)
+    TMa, TKa, TNa = tiles_for(ctx, ctx, hd)
+    Mp = _pad_to(ctx, max(TMq, TMa) * 4 * 2)
+    Np = _pad_to(ctx, max(TNq * 4, TKa))
+    Kp = _pad_to(hd, TKq)
+    assert Kp == hd, (Kp, hd)     # QK is one k-step: nothing accumulates
+    c_qk = compile_shape(Mp, Kp, Np, TMq, TKq, TNq, dtype_out="bf16")
+    # The QK output row is ctx real logits padded out to Np with zeros, and
+    # zeros are not -inf: a full-row softmax would hand 1.4% of the average
+    # row's probability mass (8.9% on the worst row, measured) to columns
+    # that are not attention. The windowed
+    # design normalises over the first ceil(ctx/16)*16 columns instead, which
+    # is the smallest window the 16-wide vector kernel can express.
+    smop = os.environ.get("CHAIN_SM", "s4w")
+    win = ((ctx + 15) // 16) * 16 if smop.endswith("w") else 0
+    if win >= Np:
+        # At audio_ctx=512 the GEMM does not pad the row at all: there is
+        # nothing to mask, so use the plain design instead of compiling a
+        # windowed one that would read the whole row anyway.
+        smop, win = "s3", 0
+    c_sm = compile_rowop(smop, nh * Mp, Np, valid=win)
+    aN = _pad_to(hd, TNa * 4)
+    c_av = compile_shape(Mp, Np, aN, TMa, TKa, TNa)
+    return {"qk": c_qk, "softmax": c_sm, "av": c_av, "Mp": Mp, "Np": Np,
+            "aN": aN, "softmax_window": win}
+
+
 class _Entry:
     __slots__ = ("name", "ctx", "kernel", "ibo", "n_insts", "A", "B", "C",
                  "Mp", "Kp", "Np", "last", "a_key")
@@ -602,37 +642,10 @@ class RawRT:
         if c is not None:
             return c
         c = _Chain()
-        # The two GEMMs of the chain want different tile shapes -- QK is skinny
-        # in K, AV is skinny in N -- and each shape implies its own row padding.
-        # Taking each from padded_shape() independently makes them disagree
-        # whenever ctx is not a multiple of 512 (QK rounds to 256, AV to 512), and
-        # the AV GEMM reads the QK output, so the chain then asserted and dropped
-        # to the host path in silence: at ctx=1152 that cost 10.0 s against 5.4 s
-        # at the LARGER ctx=1500. One row padding is derived for both stages.
-        TMq, TKq, TNq = tiles_for(ctx, hd, ctx)
-        TMa, TKa, TNa = tiles_for(ctx, ctx, hd)
-        Mp = _pad_to(ctx, max(TMq, TMa) * 4 * 2)
-        Np = _pad_to(ctx, max(TNq * 4, TKa))
-        Kp = _pad_to(hd, TKq)
-        assert Kp == hd, (Kp, hd)     # QK is one k-step: nothing accumulates
+        d = chain_designs(nh, ctx, hd)
+        c.qk, c.sm, c.av = d["qk"], d["softmax"], d["av"]
+        Mp, Np, aN = d["Mp"], d["Np"], d["aN"]
         c.Mp, c.Np = Mp, Np
-        c.qk = compile_shape(Mp, Kp, Np, TMq, TKq, TNq, dtype_out="bf16")
-        # The QK output row is ctx real logits padded out to Np with zeros, and
-        # zeros are not -inf: a full-row softmax would hand 1.4% of the average
-        # row's probability mass (8.9% on the worst row, measured) to columns
-        # that are not attention. The windowed
-        # design normalises over the first ceil(ctx/16)*16 columns instead, which
-        # is the smallest window the 16-wide vector kernel can express.
-        smop = os.environ.get("CHAIN_SM", "s4w")
-        win = ((ctx + 15) // 16) * 16 if smop.endswith("w") else 0
-        if win >= Np:
-            # At audio_ctx=512 the GEMM does not pad the row at all: there is
-            # nothing to mask, so use the plain design instead of compiling a
-            # windowed one that would read the whole row anyway.
-            smop, win = "s3", 0
-        c.sm = compile_rowop(smop, nh * Mp, Np, valid=win)
-        aN = _pad_to(hd, TNa * 4)
-        c.av = compile_shape(Mp, Np, aN, TMa, TKa, TNa)
 
         # buffers are allocated against the softmax kernel's banks; a BO from
         # one design feeding another is legal (probe_bo_share.py)
