@@ -6,7 +6,8 @@
 #   CLIPS=~/audio tests/run_all.sh serve   # + .wav/.txt pairs (not versioned)
 #
 # Stages:
-#   host   tests/test_compare_dictation.py: stdlib, no container
+#   host   tests/test_compare_dictation.py and tests/test_check_pack.py:
+#          stdlib, no container
 #   build  the ct2 image from Dockerfile (compose.ct2.yml: WITH_REFERENCE=1
 #          WITH_CT2=1), labelled with the commit; BUILD_FLAGS=--no-cache for a
 #          build from nothing
@@ -63,7 +64,7 @@ stage() {      # stage NAME COMMAND...
 
 for s in $STAGES; do
   case "$s" in
-    host)  stage host python3 -I tests/test_compare_dictation.py ;;
+    host)  stage host bash -c 'python3 -I tests/test_compare_dictation.py && python3 -I tests/test_check_pack.py' ;;
     build) echo "building revision $VCS_REF"
            # shellcheck disable=SC2086  # BUILD_FLAGS is a list of flags
            stage build docker compose build ${BUILD_FLAGS:-} stt ;;

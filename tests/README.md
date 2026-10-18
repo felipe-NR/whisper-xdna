@@ -50,6 +50,14 @@ npu 14/14, serve-torch **23/23**, serve-ct2 **28/28**. The new checks are
 `auto` detecting en on `jfk.wav` and pt on both pt-BR clips, context sized to
 the audio vs sent by the client).
 
+At `2536f7c` (weights resident across ladder steps) and at `da01369` (kernel
+pack exporter; `chain_designs()` and the encoder `taps=` refactor), on images
+built from those commits, with the same `.env` and clips: host 17/17, cpu
+24/24 + OK, npu 14/14 (golden still bit-identical), serve-torch 23/23,
+serve-ct2 28/28. After `da01369` the host stage also runs `test_check_pack.py`
+(16/16): the committed manifests in `tests/data/packs/` validate, one copy
+per defect is refused, and the tiny fixtures have the documented shapes.
+
 Earlier, before the overlay image was dropped, the same counts were reached on
 `kostryukov/npu-whisper:1.3.4` + CTranslate2 (XRT 2.21.75), and on a cached
 build of `Dockerfile` at `ea33950`. See "Pinned versions" in the top-level
