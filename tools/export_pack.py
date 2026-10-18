@@ -270,7 +270,10 @@ def verify(W, hp, ladder, roles, fixtures_mel=None, fixtures_dir=None):
                 np.save(os.path.join(fixtures_dir, f"{k}.npy"), taps[k])
             np.save(os.path.join(fixtures_dir, "out.npy"), out.astype(np.float32))
     rawxrt.RawRT._ctx_entry = orig
-    observed = {k: {r: (sorted(v)[0] if len(v) == 1 else sorted(v)) for r, v in roles_.items()}
+    # group_id() is (per-context value << 16) | bank: the high half changes with
+    # every hw_context opened, so only the bank is a property of the pack
+    observed = {k: {r: {"low16": sorted({x & 0xFFFF for x in v}),
+                        "distinct_values": len(v)} for r, v in roles_.items()}
                 for k, roles_ in groups.items()}
     return report, observed
 
@@ -343,9 +346,10 @@ def main():
                    "memlock_min_bytes": memlock,
                    "memlock_rule": "next power of two >= max(heap_bytes, max_bo_bytes)"},
         "abi": {"opcode": 3, "kernel_args": KERNEL_ARGS,
-                "memory_groups": "allocate each BO in kernel.group_id(arg_index) of the "
-                                 "kernel it feeds, queried at run time; the values differ per "
-                                 "kind (memory_groups_observed is informational)"},
+                "memory_groups": "query kernel.group_id(arg_index) on the kernel a BO feeds, "
+                                 "at run time: the value changes with every hw_context "
+                                 "(high 16 bits); memory_groups_observed records only the "
+                                 "low 16 bits seen at export, for reference"},
         "encoder_output": {"rows": "ctx (padding stripped)", "cols": hp["n_audio_state"],
                            "dtype": "f32", "space": "after ln_post"},
         "selection": dict(SELECTION, rule="smallest ladder ctx >= ceil(secs * positions_per_sec "

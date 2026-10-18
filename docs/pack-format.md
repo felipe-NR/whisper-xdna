@@ -72,15 +72,22 @@ kernel(3, insts_bo, n_insts, <buffers...>)
   insts_bo cacheable; operand BOs host_only
 ```
 
-`abi.kernel_args` holds those **argument indices**. A BO goes in the memory
-group of the argument it feeds, `kernel.group_id(arg_index)`, and the loader
-queries that at run time on the kernel itself. The values are not the indices
-and they differ per kind: 65536 for GEMM operands and 131072 for rowop
-operands, as observed, and the instruction group differs between the two
-kinds too. `abi.memory_groups_observed` records what the exporter read from
-the opened kernels, for reference only. (Packs exported before this note
-carried `group_ids` fields holding the argument indices under a misleading
-name. Ignore them.)
+`abi.kernel_args` holds those **argument indices**. They are not memory
+groups. A BO's group is `kernel.group_id(arg_index)` on the kernel it feeds,
+queried at run time, and the value is **not a constant**: on this stack it
+reads as `(n << 16) | bank`, and `n` changes with every hw_context opened.
+Across one export, the GEMM operands read 65536, 196608, 262144 and so on,
+and the rowops 131072, 327680 and so on. Only the low half is stable: bank 0
+for operands, bank 1 for instruction streams.
+`abi.memory_groups_observed` records just those low halves, plus how many
+distinct values were seen. Never cache a group across contexts. (Packs
+exported before this note carried `group_ids` fields that held the argument
+indices under a misleading name. Ignore them.)
+
+That said, the groups matter less than they look: `src/rawxrt.py` allocates
+the attention stacks against the softmax kernel and feeds them to the QK and
+AV kernels, and allocates weights against one design and feeds them to every
+ladder step's design, all with correct results.
 
 A `host_only` BO is not tied to the hw_context it was allocated against. One
 BO can feed kernels in other contexts and xclbins, and it survives their
