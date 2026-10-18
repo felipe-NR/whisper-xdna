@@ -178,7 +178,15 @@ class RawRT:
         self.max_ctx = max_ctx
         self._uuid = {}       # name -> (uuid, insts ndarray)
         self._live = {}       # name -> _Entry
-        self._wbo = {}        # (bkey, name) -> bo holding an uploaded weight
+        # (bkey, Kp, Np, TK, TN) -> bo holding an uploaded weight. Keyed by the
+        # weight's padded layout, not by design: the layout depends on K, N and
+        # the K/N tiles only, never on M, and a host_only BO is not tied to the
+        # hw_context it was allocated against -- one BO feeds every ladder step
+        # and outlives the contexts it was used in (measured: M=512/1024/1536,
+        # bit-identical results, still valid after every context was torn down).
+        # So a geometry switch no longer re-uploads 1.26 GB of turbo weights.
+        self._wbo = {}
+        self._wdesigns = set()  # designs that read a resident weight
         self._scratch = {}
         # scratch key -> design names its buffers are carved out of, so
         # eviction can drop exactly the entries that just lost their parent
@@ -209,22 +217,15 @@ class RawRT:
         return self._uuid[name]
 
     def _evict_lru(self):
-        # Least-recently-used, but a design holding resident weights loses only
-        # when nothing else is available. Plain LRU picked the fc2 design once
-        # per pass -- it is the last thing a layer touches, so it ages while the
-        # conv frontend of the NEXT pass opens two contexts -- and taking it out
-        # dropped all 32 of its cached weights, putting 419 MB back on the bus
-        # every pass. The conv, QK, softmax and AV designs
-        # cache no weights at all, so they are the right victims.
-        held = {}
-        for bkey, name in self._wbo:
-            held[name] = held.get(name, 0) + 1
-
+        # Least-recently-used, but a design that reads resident weights loses
+        # only when nothing else is available. That rule dates from when weights
+        # died with their design: plain LRU picked fc2 once per pass (it ages
+        # while the next pass's conv frontend opens two contexts) and dropped
+        # 419 MB of weights with it. Weights now outlive designs (see _wbo); the
+        # order is kept because a weight design's operand buffers are the
+        # largest to rebuild, while conv, QK, softmax and AV are cheap victims.
         victim = min(self._live.values(),
-                     key=lambda e: (held.get(e.name, 0) > 0, e.last))
-        for k in [k for k, v in self._wbo.items() if k[1] == victim.name]:
-            self._views.pop(id(self._wbo[k]), None)
-            del self._wbo[k]
+                     key=lambda e: (e.name in self._wdesigns, e.last))
         for bo in (victim.A, victim.B, victim.C):
             if bo is not None:
                 self._views.pop(id(bo), None)
@@ -520,7 +521,8 @@ class RawRT:
 
         if bkey is None:
             bkey = self._known.get(id(B))
-        wk = (bkey, e2.name)
+        wk = (bkey, Kp, Np, TK, TN)
+        self._wdesigns.add(e2.name)
         t0 = time.perf_counter()
         if bkey is not None and wk in self._wbo:
             bbo = self._wbo[wk]
@@ -956,7 +958,9 @@ class RawRT:
             e.a_key = akey_f
         _t("upload_A", time.perf_counter() - t0)
 
-        wk = (bkey, name)
+        wk = (bkey, Kp, Np, TK, TN)
+        if bkey is not None:
+            self._wdesigns.add(name)
         t0 = time.perf_counter()
         if bkey is not None and wk in self._wbo:
             bbo = self._wbo[wk]

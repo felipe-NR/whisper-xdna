@@ -384,8 +384,10 @@ def parse_multipart(body, boundary):
 def ensure_geometry(ctx):
     """Make ctx the only geometry resident on the device.
 
-    Costs one weight re-upload on the first pass after a switch (+0.6 s
-    measured); the alternative is a permanent drop to the host path.
+    Releases the old geometry's contexts and buffers; the weights stay
+    resident (rawxrt keys them by layout, not by design), so the first pass
+    after a switch rebuilds contexts and operand buffers but uploads nothing.
+    The alternative is a permanent drop to the host path.
     """
     if _state["ctx"] == ctx:
         return
@@ -479,6 +481,9 @@ def recover_if_degraded():
     RT._scratch_owner.clear()
     while RT._live:
         RT._evict_lru()
+    # Weights outlive a geometry switch, but not a degradation: whatever broke
+    # gets a clean device, uploads included.
+    RT._wbo.clear()
     RT._views.clear()
     bump("teardowns", "degradations", ctx=None)
     if RECOVER:
