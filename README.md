@@ -416,9 +416,18 @@ hardware:
 
 - `/dev/accel/accel0` is owned by group `render`; without `--group-add` the
   device node is there but unopenable.
-- XRT locks its device buffers, so `--cap-add IPC_LOCK --ulimit memlock=-1` are
-  required — without them the first buffer `mmap` fails with `EAGAIN` and the
-  NPU looks absent.
+- XRT maps its device buffers with `MAP_LOCKED`, so the kernel checks each
+  `mmap` against `RLIMIT_MEMLOCK`. The host default of 8 MB fails the first one
+  (a 64 MiB heap) with `EAGAIN`, and the NPU looks absent. Either of the two
+  flags is enough on its own: `--cap-add IPC_LOCK` works with any limit, and
+  `--ulimit memlock` works if it is at least the largest single buffer. With
+  `large-v3-turbo`, 128 MiB covers the whole ladder: the largest buffer is the
+  attention chain's, 90 MiB at ctx 1500. The check applies to each mapping on
+  its own, not to the total, and `VmLck` stays at 0, so a total-sized limit
+  such as 2 GB is not needed. Below 90 MiB the ctx-1500 pass does not fail.
+  Instead, the attention chain silently drops to the host path, and the pass
+  goes from 3.9 s to 10.1 s. Measured 2026-10-17 on kernel 7.2.5 (63 MiB fails,
+  64 MiB degrades at 1500, 128 MiB is clean).
 - No privileged mode is needed.
 
 `compose.yml` does the same with named volumes for the compiled-kernel cache

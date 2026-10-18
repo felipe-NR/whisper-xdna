@@ -263,7 +263,124 @@ decoder, a mixed sequence of 8 phrases:
 - voxtype does **not** fall back to its local backend when the service is
   down: the request fails with `Connection refused` and the dictation is lost.
 
+### With the language fixed
+
+The detection column above is not a like-for-like comparison: voxtype's
+constrained detection (`language = ["pt", "en"]`) encodes the audio twice on
+the iGPU (`select_language_from_allowed`, `src/transcribe/whisper.rs`), and the
+service detects for free. Fixed to the clip's language on both sides
+(`language = "pt"` or `"en"`, one temporary config per side), the iGPU wins
+every case.
+
+Measured through voxtype itself (`voxtype -c <config> -v transcribe <wav>`, its
+own "completed in"), voxtype 1.1.1, `large-v3-turbo`, ct2 int8 decoder on the
+service, 2026-10-17. Each case is the median of 4 runs (range in brackets).
+"Warm" means the previous request was the same clip; "after a switch" means it
+was a clip from a different ladder step. The iGPU loads its model in each
+`transcribe` process (0.32-0.36 s, not counted); the daemon keeps it resident.
+
+| phrase (ctx step on the NPU) | iGPU, fixed | NPU, fixed, warm | NPU, fixed, after a switch |
+|---|---|---|---|
+| 6 s pt (512) | 1.29 s (1.28-1.32) | 1.33 s (1.31-1.34) | 2.20 s (2.18-2.22) |
+| 11 s en, `jfk.wav` (768) | 1.30 s (1.29-1.33) | 2.05 s (2.03-2.06) | 2.93 s (2.88-2.93) |
+| 20 s pt (1280) | 1.56 s (1.55-1.57) | 3.40 s (3.36-3.44) | 4.22 s (4.20-4.24) |
+| the 8 phrases, twice | 10.92 s, 10.89 s | — | 21.37 s, 21.29 s |
+
+- The NPU's best case, short phrases back to back, ties the iGPU: 1.33 s
+  against 1.29 s. Everything else is 1.6-2.7× slower.
+- The iGPU's time barely depends on the phrase length: whisper.cpp encodes the
+  full 30 s window (1500 positions) every time. The NPU's encoder alone
+  (1.18 s at 512, 1.89 s at 768, 3.02 s at 1280, warm) costs about as much as
+  the iGPU's whole transcription, before the 0.14-0.37 s CPU decoder.
+- A switch between ladder steps costs another 0.8-0.9 s on the NPU.
+- Both sides produce the same text on all three clips: 0% WER on the 6 s and
+  11 s clips, and 12.8% on the 20 s clip on both (digits for spelled-out numbers,
+  and "8600G" for "oito mil e setecentos G").
+- The 1.46 s figure in the table above was measured the same way earlier that
+  day; this run gives 1.29-1.30 s. Every iGPU run here falls in 1.28-1.33 s
+  (6 s and 11 s clips), so the earlier figure was probably taken under some
+  other load.
+
+On speed, then, there is no case for the NPU against the 780M. What is left to
+argue is power and keeping the iGPU and the CPU free.
+
+### Energy per transcription
+
+Package energy from RAPL (`intel-rapl:0/energy_uj`, sampled every 20 ms as
+root), with the machine otherwise idle, 2026-10-17. All three paths went
+through voxtype 1.1.1 `transcribe` with the language fixed:
+
+- NPU: the service, ct2 int8 decoder on the CPU;
+- iGPU: `voxtype-vulkan`;
+- CPU: `voxtype-avx512`.
+
+Each request had a fixed slot of 15 s (25 s on the CPU), long enough to include
+the tail after it. The figure is the marginal energy: the joules over the slot
+minus the idle power over the same span. The iGPU and the CPU are counted from
+voxtype's "Transcribing" log line, which leaves out their per-process model
+load (3.6 J and 0.34 s each time; the daemon keeps the model resident). Each
+case is the median of 4-8 requests (range in brackets), `large-v3-turbo`.
+
+| phrase (ctx step) | NPU | iGPU | CPU |
+|---|---|---|---|
+| 6 s pt (512), same step as the previous one (n=5 NPU) | **29.8 J** (29.3-30.3), 1.45 s | 44.9 J (42.9-59.8), 1.29 s, all 8 | 691 J, 15.3 s |
+| 6 s pt (512), after a switch (n=3) | 45.3 J (44.5-45.6), 2.27 s | (no switch cost) | — |
+| 11 s en, `jfk.wav` (768), after a switch | 53.7 J (53.3-55.1), 3.04 s | 44.1 J (43.0-52.8), 1.29 s | 688 J, 15.3 s |
+| 20 s pt (1280), after a switch | 78.7 J (76.0-86.7), 4.33 s | 51.7 J (51.3-52.8), 1.54 s | 699 J, 15.6 s |
+| the 8 phrases | 400 J, 420 J | 385 J, 380 J | 5537 J |
+
+| idle state (90 s each) | package |
+|---|---|
+| service stopped, voxtype daemon in remote mode | 4.42 W |
+| service up, geometry resident | 4.67 W |
+| service up + a second voxtype daemon with the Vulkan model resident | 4.84 W |
+
+- **The NPU draws half the power but runs 2-3× longer.** During a request the
+  socket (amdgpu PPT) sits at 19-21 W on the NPU path and at 40-41 W on the
+  iGPU path. Energy per request comes out ahead only where the NPU is nearly
+  as fast: short phrases on an unchanged geometry, 34% less than the iGPU.
+  After a switch it ties. At 11 s and 20 s it costs 22% and 52% more. Over the
+  mixed sequence the two are level.
+- **About 10 J of every NPU request is the tail.** The NPU stays `active` for
+  5.8 s after the response (median, 4.9-6.1 s), which is the driver's
+  `autosuspend_delay_ms = 5000`, and the package sits ~1 W above idle in that
+  window. The iGPU drops to its lowest sclk level as soon as it is done (0% of
+  tail samples above level 0) and shows no tail. Without the tail, the NPU's
+  request energy is 21.7 J against the iGPU's 47 J at 6 s warm, 43.8 J against 45.8 J
+  at 11 s, and 67.8 J against 54.1 J at 20 s.
+- **Resume from runtime suspend costs ~0.12 s of latency.** With 15 s between
+  requests the NPU is suspended when each one arrives: a warm 6 s phrase takes
+  1.45 s here against 1.33 s back to back. Real dictation has gaps, so 1.45 s
+  is the realistic warm figure.
+- **The CPU share of an NPU request is small.** 4-6% of all 16 threads is the
+  ct2 decoder. The iGPU path uses 2%. The CPU-only path uses 25% for 15 s, at
+  ~14× the energy: it is not a contender.
+- **Idle cost is small and not resolved.** The resident service adds
+  ~0.25 W (its Python process: 0.6% CPU against 0.4%; the NPU itself is
+  suspended), and the resident Vulkan model adds ~0.17 W. Both are within the
+  drift between phases taken minutes apart: the iGPU tail came out at −2.1 J
+  against the same baseline.
+- These figures come from a desktop APU (8700G). A battery claim needs the
+  same measurement on a Phoenix/Hawk Point laptop.
+
+In absolute terms, the best case saves ~16 J per short phrase (~0.004 Wh):
+0.44 Wh a day at 100 dictations, at the cost of 0.16 s more latency.
+
 ## Known limits
+
+- Every encoder pass uses **9 designs** (xclbins), but NPU1 holds only 6
+  hw_contexts at once. Each warm pass therefore creates and evicts 7 contexts.
+  This was measured in the service's own code (`load_backend` and `transcribe`,
+  run in the service image), at every ladder step. The churn is cheap:
+  `CREATE_HWCTX` takes 2.2-2.6 ms per warm pass in total, about 0.1-0.2% of the
+  encoder. On the first pass after a geometry switch it takes 36-45 ms. The
+  0.6-0.9 s that a switch costs is therefore weight re-upload, not context
+  creation. Merging the designs into ≤6 xclbins would save the creation time,
+  plus whatever the evicted designs make the next pass rebuild (operand BOs,
+  attention-chain runlists). That rebuild time is inside the warm figures and
+  is not isolated here. Designs and launches per pass at ctx 512: QKV/out GEMM
+  288, fc1, fc2, GELU, QK, softmax and AV 32 each, the two convolutions and the
+  embedding GEMM 1-2 each. The other steps use the same designs with M scaled.
 
 - Speech longer than 30 s is windowed with a fixed stride, while `whisper.cpp`
   advances the window by timestamps. Text agrees inside a window and diverges at
