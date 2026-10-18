@@ -125,7 +125,13 @@ encoder on a runtime wiped of the previous source's weight BOs.
   pass 2 in every process. The likely difference: rawxrt never writes into an
   output BO from the host, so no dirty CPU line can be written back over the
   NPU's result. Any output BO the host has written to (zero-fill, reuse as an
-  input) needs a `sync(TO_DEVICE)` before the launch.
+  input) needs a `sync(TO_DEVICE)` before the launch. That guess did not hold:
+  the voxtype loader syncs after its zero-fill and still saw the effect. A
+  minimal pyxrt loop on the same XRT 2.25 does not reproduce it either. One
+  GEMM ran consecutive launches into one C, or 3 runs in flight into 3 C
+  buffers, reading line 0 right after `wait()` + `sync(FROM_DEVICE)`: 0 wrong
+  in 3,900 checks. The cause is in how that loader drives XRT, not in the
+  device. Its BO flags and sync ranges are the first suspects.
 - **Language detection.** whisper.cpp runs the encoder a second time when it
   auto-detects the language (measured from voxtype: +1.08 s on the iGPU). With
   this hook, the callback would fire twice and run the NPU encoder twice. The
