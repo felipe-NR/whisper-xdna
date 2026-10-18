@@ -78,6 +78,31 @@ ggml file voxtype downloads is f16, and 874 MB as q8_0.
 2.09 s (512), 3.20 s (768) and 5.55 s (1280). The NPU takes 1.18, 1.99 and
 3.08 s.
 
+## Encoder weights from the ggml file
+
+`src/ggml_weights.py` reads the encoder tensors straight out of a whisper.cpp
+ggml model file (f32, f16 and q8_0, numpy only), keyed the way the rest of
+the repo expects. `golden_ggml.py` runs each weight source through the NPU
+encoder on a runtime wiped of the previous source's weight BOs.
+
+- **ggml f16 is the checkpoint, bit for bit.** Both openai checkpoints are
+  stored in fp16, and so is the ggml file voxtype downloads. For whisper-tiny
+  (67 encoder tensors) and large-v3-turbo (487) the largest difference is 0.
+  The NPU output and the text are the same as with the checkpoint's weights.
+  A native integration can take its encoder weights from the one model file
+  whisper.cpp already loads, at no accuracy cost.
+- **q8_0, dequantized to bf16 at upload, costs a little and changes no text.**
+  - Weight cosine is ≥ 0.99996 for every tensor.
+  - whisper-tiny: cosine against torch fp32 drops from 0.99969 to 0.99940,
+    still above the 0.999 gate, and the transcription matches the CPU
+    reference.
+  - large-v3-turbo at ctx 1500: 0.99585 → 0.99516. The 0.999 gate does not
+    apply at this depth (see the main README), so text is the criterion. The
+    6 s @512, 11 s @768 and 20 s @1280 transcripts are identical to those
+    from the checkpoint's weights.
+  - So a single 874 MB q8_0 file could feed both the NPU encoder and the
+    decoder (see the table above). That is checked on four clips, not more.
+
 ## Caveats for a real integration
 
 - **Language detection.** whisper.cpp runs the encoder a second time when it
@@ -86,8 +111,8 @@ ggml file voxtype downloads is f16, and 874 MB as q8_0.
   integration has to cache by mel window, or detect on the same pass as the
   service does.
 - **Weights.** In this prototype the NPU features come from the service, which
-  loads the encoder weights from the openai-whisper checkpoint. Loading them
-  from the ggml f16 file instead is INBOX step 6.
+  loads its weights from the openai checkpoint. That is identical to the ggml
+  f16 file (see above). The service itself still reads the checkpoint.
 - **Encoder runtime.** The callback here copies a file. The real one drives
   the NPU through XRT. That runtime is the Python code in `src/`, and it has
   to be ported to C++.
