@@ -14,6 +14,13 @@ therefore fits any model of the same architecture, fine-tunes included.
   everything that tool refuses.
 - Example manifests, and golden fixtures for whisper-tiny, are in
   `tests/data/packs/`.
+- The built packs for those two manifests (`large-v3-turbo-xdna1-5be736d256ac`
+  and `tiny-xdna1-f25314b6f4eb`, xclbins included) are published with
+  `SHA256SUMS` in the voxtype fork's pre-release
+  [`xdna-packs-1`](https://github.com/felipe-NR/voxtype/releases/tag/xdna-packs-1).
+  Each tarball also contains this repository's LICENSE and NOTICE, as
+  `LICENSE.whisper-xdna` and `NOTICE.whisper-xdna`. A pack whose overlays
+  change gets a new `pack_id` and needs a new release.
 
 The rule for what goes in JSON: **if changing a number would need a code change
 in the loader rather than a new pack, the number belongs in the manifest.**

@@ -4,7 +4,25 @@ The question for a native voxtype integration: can whisper.cpp, the decoder
 voxtype already ships, take the encoder output this repo computes on the XDNA1
 NPU and produce the same text at a usable speed? Yes.
 
-## The hook
+> **Superseded hook.** The maintained version of the callback lives in
+> <https://github.com/felipe-NR/whisper-rs-voxtype> (MIT). It is whisper-rs
+> 0.16.0 and whisper-rs-sys 0.15.0 (whisper.cpp 1.8.3), as published on
+> crates.io, plus these commits:
+> - a tri-state callback, offered before the conv graph is built: 0 means
+>   it wrote the output, 1 declines so ggml encodes, and a negative value
+>   is a failure;
+> - `audio_ctx` applied before language auto-detection;
+> - `whisper_set_audio_ctx_with_state`;
+> - `WhisperState::set_encoder_callback` / `set_audio_ctx` and an exported
+>   `EncoderCallback` type.
+>
+> voxtype's `feat/xdna-npu-encoder` branch (felipe-NR/voxtype) pins it at
+> rev 0b7e408. Do not use the bool-returning callback in the patches below:
+> once `audio_ctx` was smaller than the state's worst case, it asserted on
+> the `embd_enc` size. They stay here only as the record of the measurements
+> in this file.
+
+## The hook (prototype)
 
 `0001-encoder-callback-v1.9.4.patch` adds a runtime callback to whisper.cpp
 (about 40 lines in `src/whisper.cpp` and `include/whisper.h`):
