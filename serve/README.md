@@ -258,6 +258,7 @@ decoder, a mixed sequence of 8 phrases:
 - **Context switches cost ~0.6-0.85 s.** A request whose length falls in a
   different ladder step than the previous one re-uploads the geometry (encoder
   1.8 s instead of 1.2 s at ctx 512). Short phrases in a row stay at 1.35 s.
+  (Before shared weights; a switch now costs 0.1-0.2 s, see below.)
 - **Long phrases are still the iGPU's.** At 20 s the NPU encoder alone is
   ~3.1 s, plus the switch.
 - voxtype does **not** fall back to its local backend when the service is
@@ -292,7 +293,12 @@ was a clip from a different ladder step. The iGPU loads its model in each
   full 30 s window (1500 positions) every time. The NPU's encoder alone
   (1.18 s at 512, 1.89 s at 768, 3.02 s at 1280, warm) costs about as much as
   the iGPU's whole transcription, before the 0.14-0.37 s CPU decoder.
-- A switch between ladder steps costs another 0.8-0.9 s on the NPU.
+- A switch between ladder steps costs another 0.8-0.9 s on the NPU. Since
+  weights stay resident across ladder steps (see "Known limits"), it costs
+  0.1-0.2 s: after a switch, 1.45 s (6 s), 2.30 s (11 s) and 3.64 s (20 s)
+  through voxtype, against 1.34 / 2.13 / 3.48 s warm. The 8 phrases take
+  17.4 s instead of 21.3 s, still well behind the iGPU's 10.9 s. The energy
+  table below was measured before this change.
 - Both sides produce the same text on all three clips: 0% WER on the 6 s and
   11 s clips, and 12.8% on the 20 s clip on both (digits for spelled-out numbers,
   and "8600G" for "oito mil e setecentos G").
@@ -375,7 +381,13 @@ In absolute terms, the best case saves ~16 J per short phrase (~0.004 Wh):
   `CREATE_HWCTX` takes 2.2-2.6 ms per warm pass in total, about 0.1-0.2% of the
   encoder. On the first pass after a geometry switch it takes 36-45 ms. The
   0.6-0.9 s that a switch costs is therefore weight re-upload, not context
-  creation. Merging the designs into ≤6 xclbins would save the creation time,
+  creation, and it is gone now: a weight BO is keyed by its padded layout
+  (K, N, tiles), which does not depend on M, and a `host_only` BO is not tied
+  to the hw_context it was allocated against. One upload (~1.26 GB of bf16
+  for turbo, in system RAM, much like the Vulkan model's 1624 MB of GTT)
+  serves every step and survives the switch teardown. The first pass after a
+  switch is now 60-100 ms over warm, down from 0.6-0.9 s.
+  Merging the designs into ≤6 xclbins would save the creation time,
   plus whatever the evicted designs make the next pass rebuild (operand BOs,
   attention-chain runlists). That rebuild time is inside the warm figures and
   is not isolated here. Designs and launches per pass at ctx 512: QKV/out GEMM
