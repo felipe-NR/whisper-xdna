@@ -67,17 +67,25 @@ Every kernel is called with opcode 3 and its instruction stream:
 
 ```
 kernel(3, insts_bo, n_insts, <buffers...>)
-  gemm:  a, b, c     (group ids 3, 4, 5)
-  rowop: in, out     (group ids 3, 4)
-  insts_bo: group id 1, cacheable; operand BOs host_only
+  gemm:  insts at argument 1; a, b, c at arguments 3, 4, 5
+  rowop: insts at argument 1; in, out at arguments 3, 4
+  insts_bo cacheable; operand BOs host_only
 ```
 
-The group ids in the manifest are **assertions**. The shim queries
-`kernel.group_id(i)` at run time and refuses on a mismatch, which signals
-pack/toolchain drift. A `host_only` BO is not tied to the hw_context it was
-allocated against. One BO can feed kernels in other contexts and xclbins, and
-it survives their teardown. That is what lets weights stay resident across
-ladder steps (`src/rawxrt.py`, `_wbo`).
+`abi.kernel_args` holds those **argument indices**. A BO goes in the memory
+group of the argument it feeds, `kernel.group_id(arg_index)`, and the loader
+queries that at run time on the kernel itself. The values are not the indices
+and they differ per kind: 65536 for GEMM operands and 131072 for rowop
+operands, as observed, and the instruction group differs between the two
+kinds too. `abi.memory_groups_observed` records what the exporter read from
+the opened kernels, for reference only. (Packs exported before this note
+carried `group_ids` fields holding the argument indices under a misleading
+name. Ignore them.)
+
+A `host_only` BO is not tied to the hw_context it was allocated against. One
+BO can feed kernels in other contexts and xclbins, and it survives their
+teardown. That is what lets weights stay resident across ladder steps
+(`src/rawxrt.py`, `_wbo`).
 
 ## Kinds and variants
 

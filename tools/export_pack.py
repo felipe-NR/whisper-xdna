@@ -44,6 +44,9 @@ DEFAULT_LADDER = (512, 768, 1024, 1280, 1500)
 # the ladder -- the rule serve/ uses for NPU_STT_CTX_FROM_AUDIO.
 SELECTION = {"positions_per_sec": 50, "margin_ratio": 0.1, "margin_positions": 16}
 WEIGHT_TYPES = ["f16", "q8_0"]
+# kernel(opcode, insts, n_insts, buffers...): argument index of each operand
+KERNEL_ARGS = {"gemm": {"insts": 1, "a": 3, "b": 4, "c": 5},
+               "rowop": {"insts": 1, "in": 3, "out": 4}}
 
 
 def sha256(path):
@@ -218,11 +221,16 @@ def verify(W, hp, ladder, roles, fixtures_mel=None, fixtures_dir=None):
     """One real pass per step; the designs it opens must be exactly the roles'."""
     import npu_whisper_encoder as E
     touched = []
+    groups = {}             # kind -> {arg role -> set of kernel.group_id() values}
     orig = rawxrt.RawRT._ctx_entry
 
     def spy(self, name):
         touched.append(name)
-        return orig(self, name)
+        e = orig(self, name)
+        kind = "gemm" if name.startswith("mm") else "rowop"
+        for role, idx in KERNEL_ARGS[kind].items():
+            groups.setdefault(kind, {}).setdefault(role, set()).add(int(e.kernel.group_id(idx)))
+        return e
 
     rawxrt.RawRT._ctx_entry = spy
     rt = rawxrt.RawRT()
@@ -262,7 +270,9 @@ def verify(W, hp, ladder, roles, fixtures_mel=None, fixtures_dir=None):
                 np.save(os.path.join(fixtures_dir, f"{k}.npy"), taps[k])
             np.save(os.path.join(fixtures_dir, "out.npy"), out.astype(np.float32))
     rawxrt.RawRT._ctx_entry = orig
-    return report
+    observed = {k: {r: (sorted(v)[0] if len(v) == 1 else sorted(v)) for r, v in roles_.items()}
+                for k, roles_ in groups.items()}
+    return report, observed
 
 
 def main():
@@ -332,10 +342,10 @@ def main():
         "memory": {"heap_bytes": HEAP_BYTES, "max_bo_bytes": max_bo,
                    "memlock_min_bytes": memlock,
                    "memlock_rule": "next power of two >= max(heap_bytes, max_bo_bytes)"},
-        "abi": {"opcode": 3, "insts_group_id": 1,
-                "gemm": {"buffers": ["a", "b", "c"], "group_ids": [3, 4, 5]},
-                "rowop": {"buffers": ["in", "out"], "group_ids": [3, 4]},
-                "group_ids_are": "assertions: query kernel.group_id(i) at run time and refuse on mismatch"},
+        "abi": {"opcode": 3, "kernel_args": KERNEL_ARGS,
+                "memory_groups": "allocate each BO in kernel.group_id(arg_index) of the "
+                                 "kernel it feeds, queried at run time; the values differ per "
+                                 "kind (memory_groups_observed is informational)"},
         "encoder_output": {"rows": "ctx (padding stripped)", "cols": hp["n_audio_state"],
                            "dtype": "f32", "space": "after ln_post"},
         "selection": dict(SELECTION, rule="smallest ladder ctx >= ceil(secs * positions_per_sec "
@@ -356,7 +366,8 @@ def main():
             audio = read_wav(a.fixtures)
             mel = whisper.log_mel_spectrogram(torch.from_numpy(whisper.pad_or_trim(audio)),
                                               n_mels=hp["n_mels"]).numpy().astype(np.float32)
-        rep = verify(W, hp, ladder, roles, mel, fixtures_dir)
+        rep, observed = verify(W, hp, ladder, roles, mel, fixtures_dir)
+        manifest["abi"]["memory_groups_observed"] = observed
         manifest["verified"] = {"date": manifest["created"],
                                 "designs_match_ladder": all(r["ok"] for r in rep.values())}
         if not manifest["verified"]["designs_match_ladder"]:
